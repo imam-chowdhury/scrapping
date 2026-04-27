@@ -12,11 +12,16 @@ python dashboard.py
 Then open:
 
 - http://localhost:5000/
+- http://localhost:5000/live
+- http://localhost:5000/analysis
 
 ## Notes
 
 - Auto refresh runs on a schedule (see constants in `dashboard.py`).
 - The dashboard stores a local cache JSON in `data/latest_news.json` (ignored by git).
+- `/` shows the 5-hour publisher compare view.
+- `/live` shows the last 1 hour mixed feed.
+- `/analysis` shows category and pace summaries for quick newsroom analysis.
 
 ## Ubuntu Docker + Domain + SSL
 
