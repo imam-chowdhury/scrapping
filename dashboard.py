@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -10,13 +11,15 @@ from flask import Flask, jsonify, render_template_string, request
 from news_scraper import DHAKA, dhaka_now, scrape_prothomalo, scrape_tbs
 
 
-REFRESH_SECONDS = 10 * 60
-WINDOW_HOURS = 5
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", str(10 * 60)))
+WINDOW_HOURS = float(os.getenv("WINDOW_HOURS", "5"))
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_FILE = DATA_DIR / "latest_news.json"
 
 app = Flask(__name__)
 state_lock = threading.Lock()
+background_lock = threading.Lock()
+background_started = False
 state: Dict = {
     "articles": [],
     "last_updated": None,
@@ -505,8 +508,22 @@ def api_refresh():
     return jsonify({"ok": True})
 
 
-if __name__ == "__main__":
+def start_background() -> None:
+    global background_started
+    with background_lock:
+        if background_started:
+            return
+        background_started = True
+
     load_state()
     threading.Thread(target=refresh_news, daemon=True).start()
     threading.Thread(target=scheduler_loop, daemon=True).start()
+
+
+if __name__ == "__main__":
+    start_background()
     app.run(host="0.0.0.0", port=5000, debug=False)
+
+
+if os.getenv("DASHBOARD_BACKGROUND", "").strip() == "1":
+    start_background()

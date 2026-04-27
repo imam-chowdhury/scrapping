@@ -1,0 +1,9 @@
+wire.automatebd.xyz {
+  encode gzip
+  reverse_proxy app:8000
+
+  # "Local SSL": put your cert files here:
+  #   ./ssl/fullchain.pem
+  #   ./ssl/privkey.pem
+  tls /certs/fullchain.pem /certs/privkey.pem
+}

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.log
 data/
+ssl/
 
 .venv/
 .env

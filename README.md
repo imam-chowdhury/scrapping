@@ -17,3 +17,7 @@ Then open:
 
 - Auto refresh runs on a schedule (see constants in `dashboard.py`).
 - The dashboard stores a local cache JSON in `data/latest_news.json` (ignored by git).
+
+## Ubuntu Docker + Domain + SSL
+
+See `DEPLOY_UBUNTU_DOCKER.md`.
