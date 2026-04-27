@@ -31,23 +31,14 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 ```
 
-## 3) SSL certificates ("local SSL")
+## 3) SSL (Trusted, no browser warning)
 
-Create `ssl/` and place your certificate files:
+Caddy will automatically issue a trusted TLS certificate (Let's Encrypt) as long as:
 
-- `ssl/fullchain.pem`
-- `ssl/privkey.pem`
+- `wire.automatebd.xyz` DNS points to this server
+- Ports `80` and `443` are reachable from the internet
 
-If you use Cloudflare, you can generate a Cloudflare Origin Certificate for `wire.automatebd.xyz` and save it as those two files.
-
-Quick self-signed (for testing only; browsers will warn):
-
-```bash
-mkdir -p ssl
-openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-  -keyout ssl/privkey.pem -out ssl/fullchain.pem \
-  -subj "/CN=wire.automatebd.xyz"
-```
+If you are using Cloudflare proxy (orange cloud), set SSL mode to **Full (strict)** after Caddy issues the cert.
 
 ## 4) Run
 
@@ -70,8 +61,7 @@ docker compose logs -f app
 API:
 
 ```bash
-curl -k https://scrap.automatebd.xyz/api/news
-curl -k https://wire.automatebd.xyz/api/news
+curl -I https://wire.automatebd.xyz/api/news
 ```
 
 Dashboard:
