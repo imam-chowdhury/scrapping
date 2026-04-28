@@ -1,23 +1,57 @@
 import json
+import math
 import os
+import hashlib
 import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
+import requests
 from flask import Flask, jsonify, render_template_string, request
 
-from news_scraper import DHAKA, dhaka_now, scrape_prothomalo, scrape_tbs
+from news_scraper import DHAKA, dhaka_now, publisher_order, scrape_sources
 
 
 REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", str(10 * 60)))
 WINDOW_HOURS = float(os.getenv("WINDOW_HOURS", "5"))
 LIVE_HOURS = 1.0
+ARTICLE_CACHE_HOURS = float(os.getenv("ARTICLE_CACHE_HOURS", "24"))
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_FILE = DATA_DIR / "latest_news.json"
-PUBLISHER_ORDER = ["Prothom Alo", "The Business Standard"]
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+def load_dotenv() -> None:
+    if not ENV_FILE.exists():
+        return
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
+OPENAI_MATCH_MODEL = os.getenv("OPENAI_MATCH_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+BASELINE_PUBLISHER = os.getenv("BASELINE_PUBLISHER", "The Daily Star").strip() or "The Daily Star"
+MATCH_CANDIDATE_LIMIT = int(os.getenv("MATCH_CANDIDATE_LIMIT", "3"))
+MATCH_MIN_SIMILARITY = float(os.getenv("MATCH_MIN_SIMILARITY", "0.58"))
+MATCH_MIN_CONFIDENCE = float(os.getenv("MATCH_MIN_CONFIDENCE", "0.75"))
+MATCH_BATCH_SIZE = int(os.getenv("MATCH_BATCH_SIZE", "5"))
+OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "120"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+SOURCE_PUBLISHERS = publisher_order()
+PUBLISHER_ORDER = [BASELINE_PUBLISHER] + [name for name in SOURCE_PUBLISHERS if name != BASELINE_PUBLISHER]
+COMPETITOR_PUBLISHERS = [name for name in PUBLISHER_ORDER if name != BASELINE_PUBLISHER]
 
 app = Flask(__name__)
 state_lock = threading.Lock()
@@ -29,6 +63,10 @@ state: Dict = {
     "next_run": None,
     "refreshing": False,
     "error": None,
+    "article_cache": {},
+    "embedding_cache": {},
+    "match_cache": {},
+    "comparison": {},
 }
 
 
@@ -53,15 +91,25 @@ def prune_articles(articles: List[Dict]) -> List[Dict]:
     return filter_recent_articles(articles, WINDOW_HOURS)
 
 
+def dedupe_articles(articles: List[Dict]) -> List[Dict]:
+    deduped = {}
+    for article in articles:
+        link = article.get("Link")
+        if link:
+            deduped[link] = article
+    return list(deduped.values())
+
+
 def sorted_publisher_counts(articles: List[Dict]) -> Dict[str, int]:
     counts = {name: 0 for name in PUBLISHER_ORDER}
     for article in articles:
-        counts[article["Publisher"]] = counts.get(article["Publisher"], 0) + 1
+        publisher = article.get("Publisher", "")
+        counts[publisher] = counts.get(publisher, 0) + 1
     return counts
 
 
 def top_categories(articles: List[Dict], limit: int = 8) -> List[Dict]:
-    counts = Counter(article["Category"] or "Uncategorized" for article in articles)
+    counts = Counter(article.get("Category") or "Uncategorized" for article in articles)
     return [{"name": name, "count": count} for name, count in counts.most_common(limit)]
 
 
@@ -92,37 +140,462 @@ def hourly_breakdown(articles: List[Dict], hours: float) -> List[Dict]:
 def shared_category_breakdown(articles: List[Dict], limit: int = 8) -> List[Dict]:
     category_map: Dict[str, Dict[str, int]] = defaultdict(lambda: {name: 0 for name in PUBLISHER_ORDER})
     for article in articles:
-        category = article["Category"] or "Uncategorized"
+        category = article.get("Category") or "Uncategorized"
         category_map[category][article["Publisher"]] = category_map[category].get(article["Publisher"], 0) + 1
 
     rows = []
     for category, counts in category_map.items():
         total = sum(counts.values())
-        rows.append(
-            {
-                "category": category,
-                "total": total,
-                "publishers": counts,
-            }
-        )
+        rows.append({"category": category, "total": total, "publishers": counts})
 
     rows.sort(key=lambda item: (item["total"], item["category"]), reverse=True)
     return rows[:limit]
 
 
 def live_signal(articles: List[Dict]) -> List[Dict]:
+    return [
+        {
+            "headline": article["Headline"],
+            "publisher": article["Publisher"],
+            "category": article.get("Category") or "Uncategorized",
+            "published_time": article["PublishedTime"],
+            "link": article["Link"],
+        }
+        for article in articles[:12]
+    ]
+
+
+def empty_comparison(status: str = "disabled", error: Optional[str] = None) -> Dict:
+    return {
+        "baseline_publisher": BASELINE_PUBLISHER,
+        "comparison_status": status,
+        "comparison_error": error,
+        "window_hours": WINDOW_HOURS,
+        "coverage_gaps": [],
+        "comparison_summary": {"covered": 0, "needs_review": 0, "potential_gap": 0, "competitor_total": 0},
+        "missed_by_source": [],
+        "category_pressure": [],
+        "architecture_note": (
+            "Sources are registry-based. Add a scraper entry and publisher name, and the same "
+            "comparison model can evaluate future outlets without UI rewrites."
+        ),
+    }
+
+
+def embedding_text(article: Dict) -> str:
+    category = article.get("Category") or "Uncategorized"
+    return f'{article["Headline"]}\nCategory: {category}'
+
+
+def request_embeddings(texts: List[str]) -> List[List[float]]:
+    response = openai_post(
+        "https://api.openai.com/v1/embeddings",
+        {"model": OPENAI_EMBEDDING_MODEL, "input": texts},
+        timeout=OPENAI_TIMEOUT_SECONDS,
+    )
+    payload = response.json()
+    items = sorted(payload.get("data", []), key=lambda item: item.get("index", 0))
+    return [item["embedding"] for item in items]
+
+
+def openai_post(url: str, payload: Dict, timeout: int) -> requests.Response:
+    last_error = None
+    for attempt in range(OPENAI_MAX_RETRIES):
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout,
+            )
+            if response.status_code in (408, 409, 429) or response.status_code >= 500:
+                response.raise_for_status()
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            last_error = exc
+            if attempt == OPENAI_MAX_RETRIES - 1:
+                raise
+            time.sleep(min(20, 2 ** attempt))
+    raise last_error or RuntimeError("OpenAI request failed")
+
+
+def ensure_embeddings(articles: List[Dict], embedding_cache: Dict[str, Dict]) -> Tuple[Dict[str, List[float]], Dict[str, Dict]]:
+    updated_cache = dict(embedding_cache or {})
+    embeddings: Dict[str, List[float]] = {}
+    pending_texts: List[str] = []
+    pending_links: List[str] = []
+
+    for article in articles:
+        link = article["Link"]
+        text = embedding_text(article)
+        cached = updated_cache.get(link)
+        if cached and cached.get("model") == OPENAI_EMBEDDING_MODEL and cached.get("text") == text:
+            embeddings[link] = cached.get("embedding", [])
+            continue
+        pending_links.append(link)
+        pending_texts.append(text)
+
+    if pending_texts:
+        vectors = request_embeddings(pending_texts)
+        for link, text, vector in zip(pending_links, pending_texts, vectors):
+            updated_cache[link] = {
+                "model": OPENAI_EMBEDDING_MODEL,
+                "text": text,
+                "embedding": vector,
+                "updated_at": dhaka_now().isoformat(),
+            }
+            embeddings[link] = vector
+
+    for article in articles:
+        link = article["Link"]
+        if link not in embeddings:
+            embeddings[link] = updated_cache.get(link, {}).get("embedding", [])
+
+    return embeddings, updated_cache
+
+
+def cosine_similarity(left: List[float], right: List[float]) -> float:
+    if not left or not right:
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def article_match_payload(article: Dict) -> Dict:
+    return {
+        "headline": article.get("Headline", ""),
+        "publisher": article.get("Publisher", ""),
+        "category": article.get("Category") or "Uncategorized",
+        "published_time": article.get("PublishedTime", ""),
+        "link": article.get("Link", ""),
+    }
+
+
+def match_cache_key(competitor: Dict, candidates: List[Tuple[Dict, float]]) -> str:
+    fingerprint = {
+        "model": OPENAI_MATCH_MODEL,
+        "competitor": article_match_payload(competitor),
+        "candidates": [
+            {"link": candidate["Link"], "headline": candidate["Headline"], "score": round(score, 4)}
+            for candidate, score in candidates
+        ],
+    }
+    raw = json.dumps(fingerprint, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def exact_match_candidate_payload(candidates: List[Tuple[Dict, float]]) -> List[Dict]:
+    return [
+        {
+            "candidate_id": index,
+            "similarity": round(score, 4),
+            **article_match_payload(candidate),
+        }
+        for index, (candidate, score) in enumerate(candidates)
+    ]
+
+
+def normalize_match_result(result: Dict) -> Dict:
+    candidate_id = result.get("candidate_id")
+    if isinstance(candidate_id, str) and candidate_id.isdigit():
+        candidate_id = int(candidate_id)
+    return {
+        "exact_match": bool(result.get("exact_match")),
+        "candidate_id": candidate_id,
+        "confidence": float(result.get("confidence") or 0),
+        "reason": str(result.get("reason") or ""),
+    }
+
+
+def request_exact_match_batch(items: List[Dict]) -> Dict[str, Dict]:
+    payload = {
+        "items": [
+            {
+                "item_id": item["item_id"],
+                "competitor_story": article_match_payload(item["competitor"]),
+                "daily_star_candidates": exact_match_candidate_payload(item["candidates"]),
+            }
+            for item in items
+        ]
+    }
+    response = openai_post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+            "model": OPENAI_MATCH_MODEL,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict newsroom coverage analyst. Decide whether a competitor "
+                        "story and a Daily Star candidate are the same exact news event/story. "
+                        "Same topic, same beat, same person, same country, same issue, or similar "
+                        "wording is not enough. Mark exact_match true only when they report the "
+                        "same event, development, announcement, incident, match, case, decision, "
+                        "or market move. Return only JSON with a results array. Each result must "
+                        "include item_id, exact_match, candidate_id, confidence, reason."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
+            "temperature": 0,
+        },
+        timeout=OPENAI_TIMEOUT_SECONDS,
+    )
+    content = response.json()["choices"][0]["message"]["content"]
+    result = json.loads(content)
+    rows = result.get("results", [])
+    return {
+        str(row.get("item_id")): normalize_match_result(row)
+        for row in rows
+        if isinstance(row, dict) and row.get("item_id") is not None
+    }
+
+
+def verify_exact_matches(items: List[Dict], match_cache: Dict[str, Dict]) -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
+    updated_cache = dict(match_cache)
+    results: Dict[str, Dict] = {}
+    pending = []
+
+    for item in items:
+        competitor = item["competitor"]
+        candidates = item["candidates"]
+        if not candidates:
+            results[competitor["Link"]] = {
+                "exact_match": False,
+                "candidate_id": None,
+                "confidence": 0,
+                "reason": "No close Daily Star candidate.",
+            }
+            continue
+
+        cache_key = match_cache_key(competitor, candidates)
+        cached = updated_cache.get(cache_key)
+        if cached:
+            results[competitor["Link"]] = cached
+            continue
+
+        pending.append({**item, "cache_key": cache_key})
+
+    for index in range(0, len(pending), MATCH_BATCH_SIZE):
+        batch = pending[index : index + MATCH_BATCH_SIZE]
+        batch_payload = [
+            {"item_id": item["competitor"]["Link"], "competitor": item["competitor"], "candidates": item["candidates"]}
+            for item in batch
+        ]
+        try:
+            batch_results = request_exact_match_batch(batch_payload)
+        except requests.RequestException as exc:
+            batch_results = {
+                item["competitor"]["Link"]: {
+                    "exact_match": False,
+                    "candidate_id": None,
+                    "confidence": 0,
+                    "reason": f"OpenAI exact-match check timed out or failed: {exc}",
+                }
+                for item in batch
+            }
+        for item in batch:
+            competitor_link = item["competitor"]["Link"]
+            result = batch_results.get(competitor_link) or {
+                "exact_match": False,
+                "candidate_id": None,
+                "confidence": 0,
+                "reason": "No exact same-event match returned.",
+            }
+            cached_result = {**result, "checked_at": dhaka_now().isoformat()}
+            updated_cache[item["cache_key"]] = cached_result
+            results[competitor_link] = cached_result
+
+    return results, updated_cache
+
+
+def prune_match_cache(cache: Dict[str, Dict], limit: int = 3000) -> Dict[str, Dict]:
+    if len(cache) <= limit:
+        return cache
+    rows = sorted(cache.items(), key=lambda item: item[1].get("checked_at", ""), reverse=True)
+    return dict(rows[:limit])
+
+
+def prune_embedding_cache(cache: Dict[str, Dict], articles: List[Dict]) -> Dict[str, Dict]:
+    allowed_links = {article["Link"] for article in articles if article.get("Link")}
+    return {link: payload for link, payload in cache.items() if link in allowed_links}
+
+
+def prune_article_cache(cache: Dict[str, Dict], articles: Optional[List[Dict]] = None) -> Dict[str, Dict]:
+    cutoff = dhaka_now() - timedelta(hours=max(WINDOW_HOURS, ARTICLE_CACHE_HOURS))
+    pruned = {}
+    for link, payload in (cache or {}).items():
+        try:
+            published = parse_time(payload["PublishedTime"])
+        except (KeyError, ValueError):
+            continue
+        if published >= cutoff:
+            pruned[link] = payload
+    return pruned
+
+
+def update_article_cache(cache: Dict[str, Dict], articles: List[Dict]) -> Dict[str, Dict]:
+    updated_cache = dict(cache or {})
+    for article in articles:
+        link = article.get("Link")
+        if link:
+            updated_cache[link] = article
+    return prune_article_cache(updated_cache, articles)
+
+
+def build_category_pressure(articles: List[Dict]) -> List[Dict]:
+    baseline_counts = Counter()
+    competitor_counts = Counter()
+
+    for article in articles:
+        category = article.get("Category") or "Uncategorized"
+        if article["Publisher"] == BASELINE_PUBLISHER:
+            baseline_counts[category] += 1
+        else:
+            competitor_counts[category] += 1
+
     rows = []
-    for article in articles[:12]:
+    for category, competitor_count in competitor_counts.items():
+        baseline_count = baseline_counts.get(category, 0)
+        delta = competitor_count - baseline_count
+        if delta <= 0:
+            continue
         rows.append(
             {
-                "headline": article["Headline"],
-                "publisher": article["Publisher"],
-                "category": article["Category"] or "Uncategorized",
-                "published_time": article["PublishedTime"],
-                "link": article["Link"],
+                "category": category,
+                "competitor_count": competitor_count,
+                "baseline_count": baseline_count,
+                "delta": delta,
             }
         )
-    return rows
+
+    rows.sort(key=lambda item: (item["delta"], item["competitor_count"], item["category"]), reverse=True)
+    return rows[:10]
+
+
+def build_comparison(articles: List[Dict], embedding_cache: Dict[str, Dict], match_cache: Dict[str, Dict]) -> Tuple[Dict, Dict[str, Dict], Dict[str, Dict]]:
+    if not OPENAI_API_KEY:
+        return empty_comparison(status="disabled"), prune_embedding_cache(embedding_cache, articles), match_cache
+
+    window_articles = filter_recent_articles(articles, WINDOW_HOURS)
+    baseline_articles = [article for article in window_articles if article["Publisher"] == BASELINE_PUBLISHER]
+    competitor_articles = [article for article in window_articles if article["Publisher"] != BASELINE_PUBLISHER]
+
+    comparison = empty_comparison(status="ready")
+    comparison["comparison_summary"]["competitor_total"] = len(competitor_articles)
+    comparison["category_pressure"] = build_category_pressure(window_articles)
+
+    if not baseline_articles or not competitor_articles:
+        return comparison, prune_embedding_cache(embedding_cache, window_articles), prune_match_cache(match_cache)
+
+    relevant_articles = baseline_articles + competitor_articles
+    embeddings, updated_cache = ensure_embeddings(relevant_articles, embedding_cache)
+    updated_match_cache = dict(match_cache or {})
+    missed_counter = Counter()
+    status_counter = Counter()
+    coverage_rows = []
+    candidate_map = {}
+
+    for competitor in competitor_articles:
+        competitor_vector = embeddings.get(competitor["Link"], [])
+        scored_candidates = []
+
+        for baseline in baseline_articles:
+            score = cosine_similarity(competitor_vector, embeddings.get(baseline["Link"], []))
+            if score >= MATCH_MIN_SIMILARITY:
+                scored_candidates.append((baseline, score))
+
+        scored_candidates.sort(key=lambda item: item[1], reverse=True)
+        candidate_map[competitor["Link"]] = scored_candidates[:MATCH_CANDIDATE_LIMIT]
+
+    verifier_results, updated_match_cache = verify_exact_matches(
+        [
+            {"competitor": competitor, "candidates": candidate_map.get(competitor["Link"], [])}
+            for competitor in competitor_articles
+        ],
+        updated_match_cache,
+    )
+
+    for competitor in competitor_articles:
+        candidates = candidate_map.get(competitor["Link"], [])
+        best_match = candidates[0][0] if candidates else None
+        best_score = round(candidates[0][1], 4) if candidates else 0.0
+        verifier_result = verifier_results.get(
+            competitor["Link"],
+            {"exact_match": False, "candidate_id": None, "confidence": 0, "reason": "No verifier result."},
+        )
+
+        matched_index = verifier_result.get("candidate_id")
+        verifier_confidence = float(verifier_result.get("confidence") or 0)
+        if (
+            verifier_result.get("exact_match")
+            and verifier_confidence >= MATCH_MIN_CONFIDENCE
+            and isinstance(matched_index, int)
+            and 0 <= matched_index < len(candidates)
+        ):
+            best_match = candidates[matched_index][0]
+            best_score = round(candidates[matched_index][1], 4)
+            status = "Covered"
+        elif candidates:
+            status = "Needs Review"
+        else:
+            status = "Potential Gap"
+
+        status_counter[status] += 1
+        if status != "Covered":
+            missed_counter[competitor["Publisher"]] += 1
+
+        coverage_rows.append(
+            {
+                "Headline": competitor["Headline"],
+                "Link": competitor["Link"],
+                "PublishedTime": competitor["PublishedTime"],
+                "Publisher": competitor["Publisher"],
+                "Category": competitor.get("Category") or "Uncategorized",
+                "status": status,
+                "similarity": best_score,
+                "match_confidence": round(float(verifier_result.get("confidence") or 0), 2),
+                "match_reason": verifier_result.get("reason", ""),
+                "best_match_headline": best_match["Headline"] if best_match else "",
+                "best_match_link": best_match["Link"] if best_match else "",
+                "best_match_published_time": best_match["PublishedTime"] if best_match else "",
+                "best_match_category": (best_match.get("Category") or "Uncategorized") if best_match else "",
+            }
+        )
+
+    coverage_rows.sort(
+        key=lambda item: (
+            0 if item["status"] == "Potential Gap" else 1 if item["status"] == "Needs Review" else 2,
+            item["similarity"],
+            item["PublishedTime"],
+        )
+    )
+
+    comparison["coverage_gaps"] = coverage_rows
+    comparison["comparison_summary"] = {
+        "covered": status_counter.get("Covered", 0),
+        "needs_review": status_counter.get("Needs Review", 0),
+        "potential_gap": status_counter.get("Potential Gap", 0),
+        "competitor_total": len(competitor_articles),
+    }
+    comparison["missed_by_source"] = [
+        {"publisher": publisher, "count": missed_counter.get(publisher, 0)}
+        for publisher in COMPETITOR_PUBLISHERS
+        if publisher in {article["Publisher"] for article in competitor_articles}
+    ]
+    return comparison, prune_embedding_cache(updated_cache, window_articles), prune_match_cache(updated_match_cache)
 
 
 def feed_snapshot(hours: float) -> Dict:
@@ -136,6 +609,9 @@ def feed_snapshot(hours: float) -> Dict:
 
     articles = filter_recent_articles(base_articles, hours)
     live_articles = filter_recent_articles(base_articles, LIVE_HOURS)
+    competitor_total = sum(
+        count for publisher, count in sorted_publisher_counts(articles).items() if publisher != BASELINE_PUBLISHER
+    )
 
     return {
         "articles": articles,
@@ -149,12 +625,19 @@ def feed_snapshot(hours: float) -> Dict:
         "last_hour_counts": sorted_publisher_counts(live_articles),
         "top_categories": top_categories(articles),
         "live_signal": live_signal(live_articles),
+        "baseline_publisher": BASELINE_PUBLISHER,
+        "publishers": PUBLISHER_ORDER,
+        "competitor_total": competitor_total,
     }
 
 
 def analysis_snapshot(hours: float) -> Dict:
     feed = feed_snapshot(hours)
     articles = feed["articles"]
+
+    with state_lock:
+        comparison = dict(state.get("comparison") or empty_comparison(status="disabled"))
+
     publisher_summaries = []
     for publisher in PUBLISHER_ORDER:
         publisher_articles = [article for article in articles if article["Publisher"] == publisher]
@@ -173,7 +656,7 @@ def analysis_snapshot(hours: float) -> Dict:
             }
         )
 
-    return {
+    payload = {
         "window_hours": feed["window_hours"],
         "count": feed["count"],
         "last_updated": feed["last_updated"],
@@ -187,7 +670,16 @@ def analysis_snapshot(hours: float) -> Dict:
         "shared_categories": shared_category_breakdown(articles),
         "publisher_summaries": publisher_summaries,
         "live_signal": feed["live_signal"],
+        "baseline_publisher": BASELINE_PUBLISHER,
+        "comparison_status": comparison.get("comparison_status", "disabled"),
+        "comparison_error": comparison.get("comparison_error"),
+        "coverage_gaps": comparison.get("coverage_gaps", []),
+        "comparison_summary": comparison.get("comparison_summary", {}),
+        "missed_by_source": comparison.get("missed_by_source", []),
+        "category_pressure": comparison.get("category_pressure", []),
+        "architecture_note": comparison.get("architecture_note", empty_comparison()["architecture_note"]),
     }
+    return payload
 
 
 def save_state() -> None:
@@ -199,6 +691,10 @@ def save_state() -> None:
                 "last_updated": state["last_updated"],
                 "next_run": state["next_run"],
                 "error": state["error"],
+                "article_cache": state.get("article_cache", {}),
+                "embedding_cache": state.get("embedding_cache", {}),
+                "match_cache": state.get("match_cache", {}),
+                "comparison": state.get("comparison", {}),
             },
             file,
             ensure_ascii=False,
@@ -215,10 +711,15 @@ def load_state() -> None:
         return
 
     with state_lock:
-        state["articles"] = prune_articles(payload.get("articles", []))
+        articles = prune_articles(payload.get("articles", []))
+        state["articles"] = articles
         state["last_updated"] = payload.get("last_updated")
         state["next_run"] = payload.get("next_run")
         state["error"] = payload.get("error")
+        state["article_cache"] = prune_article_cache(payload.get("article_cache") or {article["Link"]: article for article in articles if article.get("Link")}, articles)
+        state["embedding_cache"] = prune_embedding_cache(payload.get("embedding_cache", {}), articles)
+        state["match_cache"] = prune_match_cache(payload.get("match_cache", {}))
+        state["comparison"] = payload.get("comparison") or empty_comparison(status="disabled")
 
 
 def refresh_news() -> None:
@@ -227,21 +728,34 @@ def refresh_news() -> None:
             return
         state["refreshing"] = True
         state["error"] = None
+        current_article_cache = dict(state.get("article_cache", {}))
+        current_cache = dict(state.get("embedding_cache", {}))
+        current_match_cache = dict(state.get("match_cache", {}))
+        current_comparison = dict(state.get("comparison") or empty_comparison(status="disabled"))
 
     try:
         cutoff = dhaka_now() - timedelta(hours=WINDOW_HOURS)
-        articles = scrape_prothomalo(cutoff)
-        articles.extend(scrape_tbs(cutoff))
+        articles = dedupe_articles(scrape_sources(cutoff, article_cache=current_article_cache))
+        fresh_articles = prune_articles(articles)
+        article_cache = update_article_cache(current_article_cache, fresh_articles)
 
-        deduped = {}
-        for article in articles:
-            deduped[article["Link"]] = article
+        try:
+            comparison, embedding_cache, match_cache = build_comparison(fresh_articles, current_cache, current_match_cache)
+        except Exception as comparison_exc:
+            embedding_cache = prune_embedding_cache(current_cache, fresh_articles)
+            match_cache = prune_match_cache(current_match_cache)
+            comparison = dict(current_comparison) if current_comparison else empty_comparison(status="error")
+            comparison["baseline_publisher"] = BASELINE_PUBLISHER
+            comparison["comparison_status"] = "error"
+            comparison["comparison_error"] = str(comparison_exc)
 
-        fresh_articles = prune_articles(list(deduped.values()))
         now = dhaka_now()
-
         with state_lock:
             state["articles"] = fresh_articles
+            state["article_cache"] = article_cache
+            state["embedding_cache"] = embedding_cache
+            state["match_cache"] = match_cache
+            state["comparison"] = comparison
             state["last_updated"] = now.isoformat()
             state["next_run"] = (now + timedelta(seconds=REFRESH_SECONDS)).isoformat()
             state["refreshing"] = False
@@ -250,6 +764,9 @@ def refresh_news() -> None:
         now = dhaka_now()
         with state_lock:
             state["articles"] = prune_articles(state["articles"])
+            state["article_cache"] = prune_article_cache(state.get("article_cache", {}), state["articles"])
+            state["embedding_cache"] = prune_embedding_cache(state.get("embedding_cache", {}), state["articles"])
+            state["match_cache"] = prune_match_cache(state.get("match_cache", {}))
             state["next_run"] = (now + timedelta(seconds=REFRESH_SECONDS)).isoformat()
             state["refreshing"] = False
             state["error"] = str(exc)
@@ -272,45 +789,41 @@ PAGE = """
   <style>
     :root {
       color-scheme: light;
-      --bg: #f3efe7;
-      --panel: #fffdf8;
-      --panel-alt: #f8f2e7;
-      --text: #1f2430;
-      --muted: #6c7484;
-      --line: #ddd2c2;
+      --bg: #f5f1e7;
+      --panel: #fffdf9;
+      --panel-alt: #f6efe3;
+      --text: #1e2430;
+      --muted: #667085;
+      --line: #ded5c7;
       --accent: #0b6e4f;
-      --accent-strong: #124e78;
-      --accent-soft: #e7f4ef;
-      --ink-soft: #f4eadb;
-      --warning: #b45309;
+      --accent-dark: #124e78;
+      --accent-soft: #e8f4ef;
+      --warning: #b54708;
       --danger: #b42318;
-      --shadow: 0 10px 30px rgba(52, 44, 31, 0.08);
+      --shadow: 0 10px 28px rgba(41, 34, 24, 0.08);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: Georgia, "Noto Sans Bengali", serif;
-      background:
-        radial-gradient(circle at top left, rgba(11,110,79,0.08), transparent 22%),
-        radial-gradient(circle at top right, rgba(18,78,120,0.08), transparent 26%),
-        linear-gradient(180deg, #f7f2ea 0%, #efe7da 100%);
       color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(11,110,79,0.08), transparent 24%),
+        radial-gradient(circle at top right, rgba(18,78,120,0.08), transparent 28%),
+        linear-gradient(180deg, #f7f2ea 0%, #efe6d9 100%);
     }
-    a {
-      color: var(--accent-strong);
-      text-decoration: none;
-    }
+    a { color: var(--accent-dark); text-decoration: none; }
     a:hover { text-decoration: underline; }
     header {
-      border-bottom: 1px solid rgba(108, 116, 132, 0.16);
-      background: rgba(255, 253, 248, 0.9);
-      backdrop-filter: blur(16px);
       position: sticky;
       top: 0;
       z-index: 5;
+      background: rgba(255,253,249,0.92);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid rgba(102,112,133,0.16);
     }
-    .shell {
-      width: min(1380px, calc(100% - 32px));
+    .shell, main {
+      width: min(1400px, calc(100% - 32px));
       margin: 0 auto;
     }
     .header-row {
@@ -322,21 +835,20 @@ PAGE = """
     }
     .title-block h1 {
       margin: 0;
-      font-size: 29px;
+      font-size: 30px;
       line-height: 1.05;
-      letter-spacing: 0;
     }
     .title-block p {
       margin: 8px 0 0;
-      color: var(--muted);
+      max-width: 820px;
       font-size: 14px;
-      max-width: 760px;
+      color: var(--muted);
     }
     .actions {
       display: flex;
       gap: 10px;
-      align-items: center;
       flex-wrap: wrap;
+      align-items: center;
     }
     .button, button {
       appearance: none;
@@ -350,10 +862,7 @@ PAGE = """
       height: 40px;
       cursor: pointer;
     }
-    button:disabled {
-      cursor: wait;
-      opacity: 0.72;
-    }
+    button:disabled { opacity: 0.72; cursor: wait; }
     nav {
       display: flex;
       gap: 10px;
@@ -366,7 +875,7 @@ PAGE = """
       border: 1px solid var(--line);
       border-radius: 999px;
       padding: 10px 14px;
-      background: rgba(255, 253, 248, 0.9);
+      background: rgba(255,253,249,0.9);
       color: var(--muted);
       font-size: 14px;
       font-weight: 700;
@@ -376,24 +885,19 @@ PAGE = """
       border-color: var(--text);
       color: white;
     }
-    main {
-      width: min(1380px, calc(100% - 32px));
-      margin: 24px auto 48px;
-    }
+    main { margin: 24px auto 48px; }
     .summary-grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 14px;
     }
-    .panel, .summary-card, .signal-card {
+    .summary-card, .panel {
       background: var(--panel);
-      border: 1px solid rgba(108, 116, 132, 0.14);
+      border: 1px solid rgba(102,112,133,0.14);
       border-radius: 8px;
       box-shadow: var(--shadow);
     }
-    .summary-card {
-      padding: 16px;
-    }
+    .summary-card { padding: 16px; }
     .summary-card strong {
       display: block;
       font-size: 30px;
@@ -401,15 +905,16 @@ PAGE = """
       margin-bottom: 8px;
     }
     .summary-card span {
+      display: block;
       color: var(--muted);
       font-size: 13px;
     }
     .summary-card em {
       display: block;
       margin-top: 8px;
-      font-style: normal;
-      color: var(--accent-strong);
+      color: var(--accent-dark);
       font-size: 13px;
+      font-style: normal;
       font-weight: 700;
     }
     .status {
@@ -428,22 +933,21 @@ PAGE = """
     }
     .page-grid {
       display: grid;
-      grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.9fr);
+      grid-template-columns: minmax(0, 1.8fr) minmax(320px, 0.9fr);
       gap: 16px;
     }
+    .stack { display: grid; gap: 16px; }
     .panel-header {
       display: flex;
       justify-content: space-between;
-      gap: 14px;
       align-items: flex-start;
+      gap: 14px;
       padding: 18px 18px 0;
     }
-    .panel-header h2,
-    .panel-header h3 {
+    .panel-header h2, .panel-header h3 {
       margin: 0;
       font-size: 19px;
       line-height: 1.15;
-      letter-spacing: 0;
     }
     .panel-header p {
       margin: 6px 0 0;
@@ -455,7 +959,7 @@ PAGE = """
       gap: 10px;
       flex-wrap: wrap;
       padding: 16px 18px;
-      border-top: 1px solid rgba(108, 116, 132, 0.12);
+      border-top: 1px solid rgba(102,112,133,0.12);
     }
     input, select {
       height: 38px;
@@ -468,12 +972,10 @@ PAGE = """
     }
     input { flex: 1; min-width: 240px; }
     select { min-width: 180px; }
-    .publisher-stack {
+    .publisher-stack, .panel-body, .analysis-block {
       padding: 0 18px 18px;
     }
-    .publisher-section + .publisher-section {
-      margin-top: 18px;
-    }
+    .publisher-section + .publisher-section { margin-top: 18px; }
     .publisher-heading {
       display: flex;
       justify-content: space-between;
@@ -493,13 +995,13 @@ PAGE = """
       width: 100%;
       border-collapse: collapse;
       background: var(--panel);
-      border: 1px solid rgba(108, 116, 132, 0.12);
+      border: 1px solid rgba(102,112,133,0.12);
       border-radius: 8px;
       overflow: hidden;
     }
     th, td {
       padding: 11px 12px;
-      border-bottom: 1px solid rgba(108, 116, 132, 0.12);
+      border-bottom: 1px solid rgba(102,112,133,0.12);
       text-align: left;
       vertical-align: top;
       font-size: 14px;
@@ -511,35 +1013,23 @@ PAGE = """
       color: var(--muted);
     }
     tr:last-child td { border-bottom: 0; }
-    .age {
+    .age, .tag, .status-pill {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       min-width: 72px;
       border-radius: 999px;
-      background: var(--ink-soft);
-      border: 1px solid var(--line);
       padding: 4px 9px;
       font-size: 13px;
       font-weight: 700;
-      color: #2f3a44;
-      white-space: nowrap;
-    }
-    .age.new {
-      background: #d8f0e7;
-      border-color: #9fd2bf;
-      color: #115e59;
-    }
-    .publisher-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      border-radius: 999px;
-      padding: 4px 10px;
       border: 1px solid var(--line);
-      background: #f8f7f3;
-      font-size: 13px;
       white-space: nowrap;
+    }
+    .age { background: #f7efe2; color: #2f3a44; }
+    .age.new { background: #d8f0e7; border-color: #9fd2bf; color: #115e59; }
+    .tag {
+      background: #f8f7f3;
+      color: #344054;
     }
     .category-chip {
       display: inline-flex;
@@ -551,19 +1041,15 @@ PAGE = """
       font-size: 13px;
       font-weight: 700;
     }
-    .headline-cell {
-      min-width: 340px;
-    }
-    .headline-cell a {
-      font-weight: 700;
-    }
+    .status-pill.covered { background: #e8f4ef; border-color: #b8ddd2; color: #115e59; }
+    .status-pill.review { background: #fff2df; border-color: #f1c88b; color: var(--warning); }
+    .status-pill.gap { background: #fff2ef; border-color: #efc4bc; color: var(--danger); }
+    .headline-cell { min-width: 340px; }
+    .headline-cell a { font-weight: 700; }
     .analysis-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 16px;
-    }
-    .analysis-block {
-      padding: 18px;
     }
     .analysis-list {
       display: grid;
@@ -573,24 +1059,19 @@ PAGE = """
     .analysis-row {
       display: flex;
       justify-content: space-between;
-      gap: 14px;
       align-items: center;
+      gap: 14px;
       padding-bottom: 10px;
-      border-bottom: 1px solid rgba(108, 116, 132, 0.1);
+      border-bottom: 1px solid rgba(102,112,133,0.1);
     }
     .analysis-row:last-child {
       border-bottom: 0;
       padding-bottom: 0;
     }
-    .analysis-row strong {
-      font-size: 15px;
-    }
+    .analysis-row strong { font-size: 15px; }
     .analysis-row span {
       color: var(--muted);
       font-size: 13px;
-    }
-    .signal-card {
-      padding: 18px;
     }
     .signal-list {
       display: grid;
@@ -599,7 +1080,7 @@ PAGE = """
     }
     .signal-item {
       padding-bottom: 10px;
-      border-bottom: 1px solid rgba(108, 116, 132, 0.1);
+      border-bottom: 1px solid rgba(102,112,133,0.1);
     }
     .signal-item:last-child {
       border-bottom: 0;
@@ -610,36 +1091,31 @@ PAGE = """
       margin: 5px 0;
       font-weight: 700;
     }
-    .stack {
-      display: grid;
-      gap: 16px;
+    .note {
+      padding: 14px 16px;
+      border-radius: 8px;
+      background: #f7f3ea;
+      border: 1px solid rgba(102,112,133,0.12);
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
     }
     .empty {
       padding: 34px 18px;
       text-align: center;
       color: var(--muted);
-      border-top: 1px solid rgba(108, 116, 132, 0.1);
+      border-top: 1px solid rgba(102,112,133,0.1);
     }
-    @media (max-width: 1080px) {
-      .summary-grid,
-      .analysis-grid,
-      .page-grid {
+    @media (max-width: 1180px) {
+      .summary-grid, .analysis-grid, .page-grid {
         grid-template-columns: 1fr;
       }
     }
     @media (max-width: 760px) {
-      .header-row {
-        flex-direction: column;
-      }
-      .summary-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-      table, thead, tbody, tr, th, td {
-        display: block;
-      }
-      thead {
-        display: none;
-      }
+      .header-row { flex-direction: column; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { display: none; }
       td {
         border-bottom: 0;
         padding: 6px 12px;
@@ -651,14 +1127,8 @@ PAGE = """
         font-size: 12px;
         margin-bottom: 3px;
       }
-      .publisher-heading,
-      .analysis-row {
-        flex-direction: column;
-        align-items: flex-start;
-      }
-      .headline-cell {
-        min-width: 0;
-      }
+      .publisher-heading, .analysis-row { flex-direction: column; align-items: flex-start; }
+      .headline-cell { min-width: 0; }
     }
   </style>
 </head>
@@ -717,13 +1187,27 @@ PAGE = """
       return minutes <= 10 ? "age new" : "age";
     }
 
+    function statusClass(value) {
+      if (value === "Covered") return "status-pill covered";
+      if (value === "Needs Review") return "status-pill review";
+      return "status-pill gap";
+    }
+
     function renderSummaryCards(data) {
-      const liveTotal = Object.values(data.last_hour_counts || {}).reduce((sum, count) => sum + count, 0);
+      const baseline = pageConfig.baselinePublisher;
+      const counts = data.publisher_counts || {};
+      const liveCounts = data.last_hour_counts || {};
+      const liveTotal = Object.values(liveCounts).reduce((sum, count) => sum + count, 0);
+      const competitorTotal = Object.entries(counts)
+        .filter(([name]) => name !== baseline)
+        .reduce((sum, [, count]) => sum + count, 0);
+      const topCategory = (data.top_categories || [])[0];
       const cards = [
         { value: data.count || 0, label: `Last ${data.window_hours}h total`, note: `${liveTotal} in the last 1h` },
-        { value: (data.publisher_counts || {})["Prothom Alo"] || 0, label: "Prothom Alo", note: `${(data.last_hour_counts || {})["Prothom Alo"] || 0} in the last 1h` },
-        { value: (data.publisher_counts || {})["The Business Standard"] || 0, label: "TBS", note: `${(data.last_hour_counts || {})["The Business Standard"] || 0} in the last 1h` },
-        { value: (data.top_categories || [])[0] ? data.top_categories[0].count : 0, label: "Top category volume", note: (data.top_categories || [])[0] ? data.top_categories[0].name : "No category yet" }
+        { value: counts[baseline] || 0, label: baseline, note: `${liveCounts[baseline] || 0} in the last 1h` },
+        { value: competitorTotal, label: "Competitors", note: `${pageConfig.competitors.join(", ")}` },
+        { value: counts["Prothom Alo"] || 0, label: "Prothom Alo", note: `${liveCounts["Prothom Alo"] || 0} in the last 1h` },
+        { value: counts["The Business Standard"] || 0, label: "TBS", note: topCategory ? `${topCategory.name} leads with ${topCategory.count}` : "No category yet" }
       ];
 
       summaryGrid.innerHTML = cards.map((card) => `
@@ -735,36 +1219,51 @@ PAGE = """
       `).join("");
     }
 
-    function renderStatus(data) {
-      statusBox.className = data.error ? "status error" : "status";
-      const lastUpdated = data.last_updated ? formatTime(data.last_updated) : "not yet";
-      const nextRun = data.next_run ? formatTime(data.next_run) : "pending";
-      statusBox.textContent = data.error
-        ? `Scrape error: ${data.error}`
-        : `Last updated: ${lastUpdated}. Next scheduled scrape: ${nextRun}.`;
-      refreshBtn.disabled = Boolean(data.refreshing);
+    function renderStatus(feed, analysis) {
+      const lastUpdated = feed.last_updated ? formatTime(feed.last_updated) : "not yet";
+      const nextRun = feed.next_run ? formatTime(feed.next_run) : "pending";
+      const comparisonBits = [];
+
+      if (analysis && analysis.comparison_status) {
+        if (analysis.comparison_status === "disabled") {
+          comparisonBits.push("exact matching disabled");
+        } else if (analysis.comparison_status === "error") {
+          comparisonBits.push(`exact matching error: ${analysis.comparison_error}`);
+        } else {
+          comparisonBits.push("exact matching ready");
+        }
+      }
+
+      const extra = comparisonBits.length ? ` Comparison: ${comparisonBits.join("; ")}.` : "";
+      statusBox.className = feed.error ? "status error" : "status";
+      statusBox.textContent = feed.error
+        ? `Scrape error: ${feed.error}`
+        : `Last updated: ${lastUpdated}. Next scheduled scrape: ${nextRun}.${extra}`;
+      refreshBtn.disabled = Boolean(feed.refreshing);
     }
 
     function renderSignalCard(items) {
       return `
-        <aside class="signal-card">
+        <section class="panel">
           <div class="panel-header">
             <div>
               <h3>Fresh signal</h3>
-              <p>The first items reporters should scan right now.</p>
+              <p>The first items editors and reporters should scan.</p>
             </div>
           </div>
-          ${items.length ? `
-            <div class="signal-list">
-              ${items.map((item) => `
-                <div class="signal-item">
-                  <div class="meta">${item.publisher} · ${item.category} · ${ageText(item.published_time)}</div>
-                  <a href="${item.link}" target="_blank" rel="noreferrer">${item.headline}</a>
-                </div>
-              `).join("")}
-            </div>
-          ` : '<div class="empty">No fresh articles yet.</div>'}
-        </aside>
+          <div class="analysis-block">
+            ${items.length ? `
+              <div class="signal-list">
+                ${items.map((item) => `
+                  <div class="signal-item">
+                    <div class="meta">${item.publisher} | ${item.category} | ${ageText(item.published_time)}</div>
+                    <a href="${item.link}" target="_blank" rel="noreferrer">${item.headline}</a>
+                  </div>
+                `).join("")}
+              </div>
+            ` : '<div class="empty">No fresh articles yet.</div>'}
+          </div>
+        </section>
       `;
     }
 
@@ -780,27 +1279,23 @@ PAGE = """
     }
 
     function renderCompareView(data) {
-      const searchBar = `
-        <div class="toolbar">
-          <input id="search" type="search" placeholder="Search headline, category, publisher">
-          <select id="publisher">
-            <option value="">All publishers</option>
-            <option value="Prothom Alo">Prothom Alo</option>
-            <option value="The Business Standard">The Business Standard</option>
-          </select>
-        </div>
-      `;
-
+      const options = pageConfig.publishers.map((name) => `<option value="${name}">${name}</option>`).join("");
       content.innerHTML = `
         <section class="page-grid">
           <section class="panel">
             <div class="panel-header">
               <div>
                 <h2>Publisher compare</h2>
-                <p>Five-hour grouped feed for side-by-side scanning.</p>
+                <p>Five-hour grouped feed with ${pageConfig.baselinePublisher} first, then competitor coverage.</p>
               </div>
             </div>
-            ${searchBar}
+            <div class="toolbar">
+              <input id="search" type="search" placeholder="Search headline, category, publisher">
+              <select id="publisher">
+                <option value="">All publishers</option>
+                ${options}
+              </select>
+            </div>
             <div class="publisher-stack" id="compareResults"></div>
           </section>
           <section class="stack">
@@ -809,7 +1304,7 @@ PAGE = """
               <div class="panel-header">
                 <div>
                   <h3>Top categories</h3>
-                  <p>Where today’s publishing volume is landing.</p>
+                  <p>Where this window is concentrating coverage.</p>
                 </div>
               </div>
               <div class="analysis-block">
@@ -849,9 +1344,7 @@ PAGE = """
           .filter((name) => !selectedPublisher || name === selectedPublisher)
           .map((name) => {
             const rows = filtered.filter((article) => article.Publisher === name);
-            if (!rows.length) {
-              return "";
-            }
+            if (!rows.length) return "";
             return `
               <section class="publisher-section">
                 <div class="publisher-heading">
@@ -884,7 +1377,7 @@ PAGE = """
         <tr>
           <td data-label="Published">${formatTime(article.PublishedTime)}</td>
           <td data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></td>
-          <td data-label="Publisher"><span class="publisher-badge">${article.Publisher}</span></td>
+          <td data-label="Publisher"><span class="tag">${article.Publisher}</span></td>
           <td data-label="Category"><span class="category-chip">${article.Category || "Uncategorized"}</span></td>
           <td data-label="Headline" class="headline-cell"><a href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a></td>
         </tr>
@@ -896,7 +1389,7 @@ PAGE = """
             <div class="panel-header">
               <div>
                 <h2>Live wire</h2>
-                <p>One-hour mixed stream for immediate newsroom monitoring.</p>
+                <p>One-hour mixed stream to catch breaking moves quickly.</p>
               </div>
             </div>
             ${rows ? `
@@ -922,7 +1415,7 @@ PAGE = """
               <div class="panel-header">
                 <div>
                   <h3>Publisher pace</h3>
-                  <p>Who is publishing fastest inside the live window.</p>
+                  <p>Who is moving fastest in the last hour.</p>
                 </div>
               </div>
               <div class="analysis-block">
@@ -941,94 +1434,210 @@ PAGE = """
       `;
     }
 
+    function renderCoverageRows(rows) {
+      if (!rows.length) {
+        return '<div class="empty">No competitor stories in the active window.</div>';
+      }
+      return `
+        <div class="publisher-stack">
+          <table>
+            <thead>
+              <tr>
+                <th>Publisher</th>
+                <th>Published</th>
+                <th>Status</th>
+                <th>Similarity</th>
+                <th>Confidence</th>
+                <th>Category</th>
+                <th>Competitor story</th>
+                <th>Best Daily Star match</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map((item) => `
+                <tr>
+                  <td data-label="Publisher"><span class="tag">${item.Publisher}</span></td>
+                  <td data-label="Published">${formatTime(item.PublishedTime)}<br><span class="meta">${ageText(item.PublishedTime)}</span></td>
+                  <td data-label="Status"><span class="${statusClass(item.status)}">${item.status}</span></td>
+                  <td data-label="Similarity">${(item.similarity || 0).toFixed(2)}</td>
+                  <td data-label="Confidence">${(item.match_confidence || 0).toFixed(2)}<div class="meta">${item.match_reason || ""}</div></td>
+                  <td data-label="Category"><span class="category-chip">${item.Category || "Uncategorized"}</span></td>
+                  <td data-label="Competitor story" class="headline-cell"><a href="${item.Link}" target="_blank" rel="noreferrer">${item.Headline}</a></td>
+                  <td data-label="Best Daily Star match" class="headline-cell">
+                    ${item.best_match_link
+                      ? `<a href="${item.best_match_link}" target="_blank" rel="noreferrer">${item.best_match_headline}</a><div class="meta">${item.best_match_category || ""}</div>`
+                      : '<span class="meta">No baseline match found</span>'}
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
     function renderAnalysisView(data) {
+      const comparisonStatus = data.comparison_status || "disabled";
+      const gapRows = (data.coverage_gaps || []).filter((row) => row.status !== "Covered");
+      const comparisonMessage = comparisonStatus === "disabled"
+        ? "OpenAI exact matching is disabled. Add OPENAI_API_KEY to enable Daily Star gap analysis."
+        : comparisonStatus === "error"
+          ? `OpenAI exact matching failed. Showing last saved results. ${data.comparison_error || ""}`
+          : "Exact coverage matching is active. Embeddings shortlist candidates, then OpenAI confirms only same-event matches as covered.";
+
       content.innerHTML = `
-        <section class="analysis-grid">
-          <section class="panel analysis-block">
+        <section class="stack">
+          <section class="panel">
             <div class="panel-header">
               <div>
-                <h2>Publisher summaries</h2>
-                <p>Quick read on who is pushing volume and where.</p>
+                <h2>Coverage gap analysis</h2>
+                <p>${pageConfig.baselinePublisher} is the baseline. Competitor stories are matched against its recent output.</p>
               </div>
             </div>
-            <div class="analysis-list">
-              ${(data.publisher_summaries || []).map((item) => `
+            <div class="analysis-block">
+              <div class="note">${comparisonMessage}</div>
+              <div class="analysis-list">
                 <div class="analysis-row">
-                  <div>
-                    <strong>${item.name}</strong>
-                    <span>${item.count} in last ${data.window_hours}h, ${item.last_hour_count} in last 1h</span>
-                  </div>
-                  <span>${item.latest_published_time ? `Latest ${formatTime(item.latest_published_time)}` : "No recent items"}</span>
+                  <strong>Potential gaps</strong>
+                  <span>${(data.comparison_summary || {}).potential_gap || 0}</span>
                 </div>
-              `).join("")}
-            </div>
-          </section>
-          <section class="panel analysis-block">
-            <div class="panel-header">
-              <div>
-                <h2>Shared categories</h2>
-                <p>Where both publishers are clustering coverage.</p>
-              </div>
-            </div>
-            <div class="analysis-list">
-              ${(data.shared_categories || []).map((item) => `
                 <div class="analysis-row">
-                  <div>
-                    <strong>${item.category}</strong>
-                    <span>${item.total} total</span>
-                  </div>
-                  <span>PA ${(item.publishers || {})["Prothom Alo"] || 0} · TBS ${(item.publishers || {})["The Business Standard"] || 0}</span>
+                  <strong>Needs review</strong>
+                  <span>${(data.comparison_summary || {}).needs_review || 0}</span>
                 </div>
-              `).join("")}
-            </div>
-          </section>
-          <section class="panel analysis-block">
-            <div class="panel-header">
-              <div>
-                <h2>Hourly breakdown</h2>
-                <p>Publishing rhythm over the current five-hour window.</p>
+                <div class="analysis-row">
+                  <strong>Covered competitor stories</strong>
+                  <span>${(data.comparison_summary || {}).covered || 0}</span>
+                </div>
+                <div class="analysis-row">
+                  <strong>Total competitor stories scored</strong>
+                  <span>${(data.comparison_summary || {}).competitor_total || 0}</span>
+                </div>
               </div>
             </div>
-            ${(data.hourly_breakdown || []).length ? `
-              <table>
-                <thead>
-                  <tr>
-                    <th>Hour</th>
-                    <th>Total</th>
-                    <th>Prothom Alo</th>
-                    <th>TBS</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${(data.hourly_breakdown || []).map((item) => `
-                    <tr>
-                      <td data-label="Hour">${item.label}</td>
-                      <td data-label="Total">${item.total}</td>
-                      <td data-label="Prothom Alo">${item["Prothom Alo"] || 0}</td>
-                      <td data-label="TBS">${item["The Business Standard"] || 0}</td>
-                    </tr>
-                  `).join("")}
-                </tbody>
-              </table>
-            ` : '<div class="empty">No hourly data yet.</div>'}
+            ${renderCoverageRows(gapRows)}
           </section>
-          <section class="stack">
-            ${renderSignalCard(data.live_signal || [])}
+
+          <section class="analysis-grid">
             <section class="panel analysis-block">
               <div class="panel-header">
                 <div>
-                  <h3>Top categories</h3>
-                  <p>Highest-volume coverage buckets right now.</p>
+                  <h3>Missed by source</h3>
+                  <p>How often each competitor produced a non-covered story.</p>
                 </div>
               </div>
               <div class="analysis-list">
-                ${(data.top_categories || []).map((item) => `
+                ${(data.missed_by_source || []).map((item) => `
                   <div class="analysis-row">
-                    <strong>${item.name}</strong>
-                    <span>${item.count} articles</span>
+                    <strong>${item.publisher}</strong>
+                    <span>${item.count} flagged stories</span>
+                  </div>
+                `).join("") || '<div class="empty">No missed-by-source data yet.</div>'}
+              </div>
+            </section>
+
+            <section class="panel analysis-block">
+              <div class="panel-header">
+                <div>
+                  <h3>Category pressure</h3>
+                  <p>Topics where competitors are publishing more than the baseline.</p>
+                </div>
+              </div>
+              <div class="analysis-list">
+                ${(data.category_pressure || []).map((item) => `
+                  <div class="analysis-row">
+                    <div>
+                      <strong>${item.category}</strong>
+                      <span>Competitors ${item.competitor_count}, ${pageConfig.baselinePublisher} ${item.baseline_count}</span>
+                    </div>
+                    <span>+${item.delta}</span>
+                  </div>
+                `).join("") || '<div class="empty">No category pressure detected.</div>'}
+              </div>
+            </section>
+
+            <section class="panel analysis-block">
+              <div class="panel-header">
+                <div>
+                  <h3>Publisher pace</h3>
+                  <p>Volume in the full window and in the last hour.</p>
+                </div>
+              </div>
+              <div class="analysis-list">
+                ${(data.publisher_summaries || []).map((item) => `
+                  <div class="analysis-row">
+                    <div>
+                      <strong>${item.name}</strong>
+                      <span>${item.count} in ${data.window_hours}h, ${item.last_hour_count} in 1h</span>
+                    </div>
+                    <span>${item.latest_published_time ? `Latest ${formatTime(item.latest_published_time)}` : "No recent items"}</span>
                   </div>
                 `).join("")}
               </div>
+            </section>
+
+            <section class="panel analysis-block">
+              <div class="panel-header">
+                <div>
+                  <h3>Source architecture</h3>
+                  <p>Future source additions should not need a new dashboard model.</p>
+                </div>
+              </div>
+              <div class="note">${data.architecture_note}</div>
+            </section>
+          </section>
+
+          <section class="analysis-grid">
+            <section class="panel analysis-block">
+              <div class="panel-header">
+                <div>
+                  <h3>Hourly breakdown</h3>
+                  <p>Publishing rhythm over the active window.</p>
+                </div>
+              </div>
+              ${(data.hourly_breakdown || []).length ? `
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Hour</th>
+                      <th>Total</th>
+                      ${pageConfig.publishers.map((name) => `<th>${name}</th>`).join("")}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${(data.hourly_breakdown || []).map((item) => `
+                      <tr>
+                        <td data-label="Hour">${item.label}</td>
+                        <td data-label="Total">${item.total}</td>
+                        ${pageConfig.publishers.map((name) => `<td data-label="${name}">${item[name] || 0}</td>`).join("")}
+                      </tr>
+                    `).join("")}
+                  </tbody>
+                </table>
+              ` : '<div class="empty">No hourly data yet.</div>'}
+            </section>
+
+            <section class="stack">
+              ${renderSignalCard(data.live_signal || [])}
+              <section class="panel analysis-block">
+                <div class="panel-header">
+                  <div>
+                    <h3>Shared categories</h3>
+                    <p>Where the whole market is clustering coverage.</p>
+                  </div>
+                </div>
+                <div class="analysis-list">
+                  ${(data.shared_categories || []).map((item) => `
+                    <div class="analysis-row">
+                      <div>
+                        <strong>${item.category}</strong>
+                        <span>${item.total} total</span>
+                      </div>
+                      <span>${pageConfig.publishers.map((name) => `${name}: ${(item.publishers || {})[name] || 0}`).join(" | ")}</span>
+                    </div>
+                  `).join("")}
+                </div>
+              </section>
             </section>
           </section>
         </section>
@@ -1049,7 +1658,7 @@ PAGE = """
       }
 
       renderSummaryCards(feedData);
-      renderStatus(feedData);
+      renderStatus(feedData, analysisData);
 
       if (pageConfig.viewMode === "live") {
         renderLiveView(feedData);
@@ -1085,6 +1694,8 @@ def render_page(view_mode: str, title: str, subtitle: str, hours: float):
             "viewMode": view_mode,
             "hours": hours,
             "publishers": PUBLISHER_ORDER,
+            "baselinePublisher": BASELINE_PUBLISHER,
+            "competitors": COMPETITOR_PUBLISHERS,
         },
     )
 
@@ -1094,7 +1705,7 @@ def index():
     return render_page(
         "compare",
         "Reporter News Dashboard",
-        "Five-hour compare view for Prothom Alo and TBS, grouped so reporters can scan coverage side by side.",
+        "Five-hour compare view with The Daily Star as the baseline and Prothom Alo plus TBS grouped for direct editorial comparison.",
         WINDOW_HOURS,
     )
 
@@ -1104,7 +1715,7 @@ def live():
     return render_page(
         "live",
         "Reporter Live Wire",
-        "One-hour mixed feed for fast monitoring, new-story detection, and immediate follow-up decisions.",
+        "One-hour mixed feed for immediate detection of what the market is pushing right now.",
         LIVE_HOURS,
     )
 
@@ -1113,8 +1724,8 @@ def live():
 def analysis():
     return render_page(
         "analysis",
-        "Reporter Analysis View",
-        "A compact readout of pace, category concentration, and overlap so the desk can spot patterns quickly.",
+        "Coverage Gap Analysis",
+        "Daily Star centric analysis for spotting competitor stories that may need follow-up from your newsroom.",
         WINDOW_HOURS,
     )
 
@@ -1133,8 +1744,7 @@ def api_analysis():
 
 @app.post("/api/refresh")
 def api_refresh():
-    if request.method == "POST":
-        threading.Thread(target=refresh_news, daemon=True).start()
+    threading.Thread(target=refresh_news, daemon=True).start()
     return jsonify({"ok": True})
 
 
