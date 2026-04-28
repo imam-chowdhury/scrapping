@@ -99,6 +99,26 @@ def normalize_category(value: str) -> str:
     return cleaned.title()
 
 
+def clean_text(value: str, limit: int = 1200) -> str:
+    return " ".join((value or "").split())[:limit]
+
+
+def meta_description(soup: BeautifulSoup) -> str:
+    meta = soup.select_one('meta[name="description"][content], meta[property="og:description"][content]')
+    return clean_text(meta.get("content", "") if meta else "")
+
+
+def body_snippet(soup: BeautifulSoup, selectors: str, limit: int = 1200) -> str:
+    paragraphs = []
+    for paragraph in soup.select(selectors):
+        text = clean_text(paragraph.get_text(" ", strip=True), limit=limit)
+        if text:
+            paragraphs.append(text)
+        if len(" ".join(paragraphs)) >= limit:
+            break
+    return clean_text(" ".join(paragraphs), limit=limit)
+
+
 def parse_relative_minutes(text: str) -> Optional[int]:
     normalized = " ".join(text.split()).lower()
     if not normalized:
@@ -138,6 +158,10 @@ def cached_article(link: str, article_cache: Optional[Dict[str, Dict[str, str]]]
     return dict(article)
 
 
+def has_match_context(article: Dict[str, str]) -> bool:
+    return bool(clean_text(article.get("Summary", "")) or clean_text(article.get("BodySnippet", "")))
+
+
 def cached_recent_article(link: str, cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]]) -> Optional[Dict[str, str]]:
     article = cached_article(link, article_cache)
     if not article:
@@ -157,7 +181,7 @@ def scrape_prothomalo(cutoff: datetime, page_size: int = 25, article_cache: Opti
     offset = 0
 
     while True:
-        fields = "headline,slug,published-at,sections"
+        fields = "headline,slug,published-at,sections,summary,subheadline"
         url = (
             "https://www.prothomalo.com/api/v1/collections/latest-all"
             f"?limit={page_size}&offset={offset}&fields={fields}"
@@ -197,6 +221,8 @@ def scrape_prothomalo(cutoff: datetime, page_size: int = 25, article_cache: Opti
                     "PublishedTime": published.isoformat(),
                     "Publisher": "Prothom Alo",
                     "Category": category,
+                    "Summary": clean_text(story.get("summary") or story.get("subheadline") or ""),
+                    "BodySnippet": clean_text(story.get("summary") or story.get("subheadline") or ""),
                 }
             )
 
@@ -272,6 +298,8 @@ def extract_daily_star_article(
     title = soup.select_one("h1")
     if title:
         headline = " ".join(title.get_text(" ", strip=True).split()) or headline
+    summary = meta_description(soup)
+    snippet = body_snippet(soup, ".node-content p, article p, .field--name-body p")
 
     meta_block = soup.select_one(".block-article-meta-block")
     meta_text = meta_block.get_text(" ", strip=True) if meta_block else ""
@@ -294,6 +322,8 @@ def extract_daily_star_article(
         "PublishedTime": published.isoformat(),
         "Publisher": "The Daily Star",
         "Category": category,
+        "Summary": summary,
+        "BodySnippet": snippet or summary,
     }
 
 
@@ -334,7 +364,7 @@ def scrape_daily_star(cutoff: datetime, article_cache: Optional[Dict[str, Dict[s
     uncached_candidates = {}
     for link, (headline, published) in candidates.items():
         cached = cached_recent_article(link, cutoff, article_cache)
-        if cached and cached.get("Publisher") == "The Daily Star":
+        if cached and cached.get("Publisher") == "The Daily Star" and has_match_context(cached):
             articles.append(cached)
         else:
             uncached_candidates[link] = (headline, published)
@@ -415,6 +445,8 @@ def extract_tbs_article(link: str) -> Optional[Dict[str, str]]:
     if headline is None:
         title = soup.select_one('meta[property="og:title"][content]')
         headline = title["content"] if title else ""
+    summary = meta_description(soup)
+    snippet = body_snippet(soup, "article p, .news-details p, .field--name-body p, .article-content p")
 
     breadcrumb_names = []
     for script in soup.find_all("script", type="application/ld+json"):
@@ -437,6 +469,8 @@ def extract_tbs_article(link: str) -> Optional[Dict[str, str]]:
         "PublishedTime": published.isoformat(),
         "Publisher": "The Business Standard",
         "Category": breadcrumb_names[-1] if breadcrumb_names else "",
+        "Summary": summary,
+        "BodySnippet": snippet or summary,
     }
 
 
@@ -467,9 +501,11 @@ def scrape_tbs(cutoff: datetime, max_pages: int = 10, article_cache: Optional[Di
             if cached and cached.get("Publisher") == "The Business Standard":
                 cached_published = datetime.fromisoformat(cached["PublishedTime"]).astimezone(DHAKA)
                 oldest_on_page = cached_published if oldest_on_page is None else min(oldest_on_page, cached_published)
-                if cached_published >= cutoff:
+                if cached_published < cutoff:
+                    continue
+                if cached_published >= cutoff and has_match_context(cached):
                     articles.append(cached)
-                continue
+                    continue
 
             article = extract_tbs_article(link)
             if not article:

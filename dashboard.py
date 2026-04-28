@@ -184,7 +184,9 @@ def empty_comparison(status: str = "disabled", error: Optional[str] = None) -> D
 
 def embedding_text(article: Dict) -> str:
     category = article.get("Category") or "Uncategorized"
-    return f'{article["Headline"]}\nCategory: {category}'
+    summary = article.get("Summary") or ""
+    snippet = article.get("BodySnippet") or ""
+    return f'{article["Headline"]}\nCategory: {category}\nSummary: {summary}\nArticle text: {snippet}'
 
 
 def request_embeddings(texts: List[str]) -> List[List[float]]:
@@ -274,6 +276,8 @@ def article_match_payload(article: Dict) -> Dict:
         "headline": article.get("Headline", ""),
         "publisher": article.get("Publisher", ""),
         "category": article.get("Category") or "Uncategorized",
+        "summary": article.get("Summary", ""),
+        "article_text_snippet": article.get("BodySnippet", ""),
         "published_time": article.get("PublishedTime", ""),
         "link": article.get("Link", ""),
     }
@@ -284,7 +288,7 @@ def match_cache_key(competitor: Dict, candidates: List[Tuple[Dict, float]]) -> s
         "model": OPENAI_MATCH_MODEL,
         "competitor": article_match_payload(competitor),
         "candidates": [
-            {"link": candidate["Link"], "headline": candidate["Headline"], "score": round(score, 4)}
+            {"candidate": article_match_payload(candidate), "score": round(score, 4)}
             for candidate, score in candidates
         ],
     }
@@ -337,10 +341,13 @@ def request_exact_match_batch(items: List[Dict]) -> Dict[str, Dict]:
                     "content": (
                         "You are a strict newsroom coverage analyst. Decide whether a competitor "
                         "story and a Daily Star candidate are the same exact news event/story. "
+                        "Use headline, summary, article text snippet, category, source, and time. "
                         "Same topic, same beat, same person, same country, same issue, or similar "
-                        "wording is not enough. Mark exact_match true only when they report the "
-                        "same event, development, announcement, incident, match, case, decision, "
-                        "or market move. Return only JSON with a results array. Each result must "
+                        "wording is not enough. Mark exact_match true only when article details "
+                        "show they report the same event, development, announcement, incident, "
+                        "match, case, decision, or market move. If either article lacks enough "
+                        "detail, return exact_match false with low confidence. Return only JSON "
+                        "with a results array. Each result must "
                         "include item_id, exact_match, candidate_id, confidence, reason."
                     ),
                 },
@@ -1031,6 +1038,37 @@ PAGE = """
       background: #f8f7f3;
       color: #344054;
     }
+    .publication-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 118px;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 13px;
+      font-weight: 800;
+      border: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    .publisher-daily-star {
+      background: #e8f4ef;
+      border-color: #9fd2bf;
+      color: #115e59;
+    }
+    .publisher-prothom-alo {
+      background: #fff2ef;
+      border-color: #efc4bc;
+      color: #b42318;
+    }
+    .publisher-tbs {
+      background: #eef6fb;
+      border-color: #b5d7eb;
+      color: #195b84;
+    }
+    .publisher-unknown {
+      background: #f8f7f3;
+      color: #344054;
+    }
     .category-chip {
       display: inline-flex;
       align-items: center;
@@ -1193,6 +1231,13 @@ PAGE = """
       return "status-pill gap";
     }
 
+    function publisherClass(value) {
+      if (value === "The Daily Star") return "publisher-daily-star";
+      if (value === "Prothom Alo") return "publisher-prothom-alo";
+      if (value === "The Business Standard" || value === "TBS") return "publisher-tbs";
+      return "publisher-unknown";
+    }
+
     function renderSummaryCards(data) {
       const baseline = pageConfig.baselinePublisher;
       const counts = data.publisher_counts || {};
@@ -1270,6 +1315,7 @@ PAGE = """
     function compareTableRows(rows) {
       return rows.map((article) => `
         <tr>
+          <td data-label="Publisher"><span class="publication-pill ${publisherClass(article.Publisher)}">${article.Publisher}</span></td>
           <td data-label="Published">${formatTime(article.PublishedTime)}</td>
           <td data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></td>
           <td data-label="Category"><span class="category-chip">${article.Category || "Uncategorized"}</span></td>
@@ -1286,7 +1332,7 @@ PAGE = """
             <div class="panel-header">
               <div>
                 <h2>Publisher compare</h2>
-                <p>Five-hour grouped feed with ${pageConfig.baselinePublisher} first, then competitor coverage.</p>
+                <p>All-publication timeline sorted newest to oldest so reporters can spot the latest move first.</p>
               </div>
             </div>
             <div class="toolbar">
@@ -1333,38 +1379,33 @@ PAGE = """
           const text = `${article.Headline} ${article.Category} ${article.Publisher}`.toLowerCase();
           return (!selectedPublisher || article.Publisher === selectedPublisher) &&
             (!term || text.includes(term));
-        });
+        }).sort((left, right) => new Date(right.PublishedTime) - new Date(left.PublishedTime));
 
         if (!filtered.length) {
           compareResults.innerHTML = '<div class="empty">No matching articles in this view.</div>';
           return;
         }
 
-        compareResults.innerHTML = pageConfig.publishers
-          .filter((name) => !selectedPublisher || name === selectedPublisher)
-          .map((name) => {
-            const rows = filtered.filter((article) => article.Publisher === name);
-            if (!rows.length) return "";
-            return `
-              <section class="publisher-section">
-                <div class="publisher-heading">
-                  <h3>${name}</h3>
-                  <div class="meta">${rows.length} articles, newest first</div>
-                </div>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Published</th>
-                      <th>Age</th>
-                      <th>Category</th>
-                      <th>Headline</th>
-                    </tr>
-                  </thead>
-                  <tbody>${compareTableRows(rows)}</tbody>
-                </table>
-              </section>
-            `;
-          }).join("");
+        compareResults.innerHTML = `
+          <section class="publisher-section">
+            <div class="publisher-heading">
+              <h3>All publications</h3>
+              <div class="meta">${filtered.length} articles, newest first</div>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Publisher</th>
+                  <th>Published</th>
+                  <th>Age</th>
+                  <th>Category</th>
+                  <th>Headline</th>
+                </tr>
+              </thead>
+              <tbody>${compareTableRows(filtered)}</tbody>
+            </table>
+          </section>
+        `;
       }
 
       search.addEventListener("input", paintCompare);
@@ -1705,7 +1746,7 @@ def index():
     return render_page(
         "compare",
         "Reporter News Dashboard",
-        "Five-hour compare view with The Daily Star as the baseline and Prothom Alo plus TBS grouped for direct editorial comparison.",
+        "Five-hour all-publication timeline for seeing The Daily Star, Prothom Alo, and TBS with the newest story first.",
         WINDOW_HOURS,
     )
 
