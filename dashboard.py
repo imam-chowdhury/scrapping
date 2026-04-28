@@ -2,6 +2,7 @@ import json
 import math
 import os
 import hashlib
+import re
 import threading
 import time
 from collections import Counter, defaultdict
@@ -52,6 +53,63 @@ OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 SOURCE_PUBLISHERS = publisher_order()
 PUBLISHER_ORDER = [BASELINE_PUBLISHER] + [name for name in SOURCE_PUBLISHERS if name != BASELINE_PUBLISHER]
 COMPETITOR_PUBLISHERS = [name for name in PUBLISHER_ORDER if name != BASELINE_PUBLISHER]
+CATEGORY_ALIASES = {
+    "Politics / রাজনীতি": {
+        "politics",
+        "political",
+        "রাজনীতি",
+    },
+    "Bangladesh / বাংলাদেশ": {
+        "bangladesh",
+        "national",
+        "nation",
+        "বাংলাদেশ",
+        "জাতীয়",
+        "জাতীয়",
+    },
+    "World / বিশ্ব": {
+        "world",
+        "international",
+        "global",
+        "বিশ্ব",
+        "আন্তর্জাতিক",
+    },
+    "Business / বাণিজ্য": {
+        "business",
+        "economy",
+        "economics",
+        "market",
+        "markets",
+        "trade",
+        "বানিজ্য",
+        "বাণিজ্য",
+        "অর্থনীতি",
+    },
+    "Sports / খেলা": {
+        "sport",
+        "sports",
+        "game",
+        "games",
+        "খেলা",
+        "ক্রীড়া",
+        "ক্রীড়া",
+    },
+    "Entertainment / বিনোদন": {
+        "entertainment",
+        "showbiz",
+        "culture",
+        "arts",
+        "বিনোদন",
+        "সংস্কৃতি",
+    },
+    "Technology / প্রযুক্তি": {
+        "technology",
+        "tech",
+        "startup",
+        "startups",
+        "প্রযুক্তি",
+    },
+}
 
 app = Flask(__name__)
 state_lock = threading.Lock()
@@ -108,8 +166,27 @@ def sorted_publisher_counts(articles: List[Dict]) -> Dict[str, int]:
     return counts
 
 
+def normalize_category_key(value: str) -> str:
+    lowered = (value or "").strip().lower()
+    lowered = re.sub(r"[&/,_-]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip()
+
+
+def canonical_category_name(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return "Uncategorized"
+
+    category_key = normalize_category_key(raw)
+    for canonical_name, aliases in CATEGORY_ALIASES.items():
+        if category_key in aliases:
+            return canonical_name
+    return raw
+
+
 def top_categories(articles: List[Dict], limit: int = 8) -> List[Dict]:
-    counts = Counter(article.get("Category") or "Uncategorized" for article in articles)
+    counts = Counter(canonical_category_name(article.get("Category", "")) for article in articles)
     return [{"name": name, "count": count} for name, count in counts.most_common(limit)]
 
 
@@ -140,7 +217,7 @@ def hourly_breakdown(articles: List[Dict], hours: float) -> List[Dict]:
 def shared_category_breakdown(articles: List[Dict], limit: int = 8) -> List[Dict]:
     category_map: Dict[str, Dict[str, int]] = defaultdict(lambda: {name: 0 for name in PUBLISHER_ORDER})
     for article in articles:
-        category = article.get("Category") or "Uncategorized"
+        category = canonical_category_name(article.get("Category", ""))
         category_map[category][article["Publisher"]] = category_map[category].get(article["Publisher"], 0) + 1
 
     rows = []
@@ -467,7 +544,7 @@ def build_category_pressure(articles: List[Dict]) -> List[Dict]:
     competitor_counts = Counter()
 
     for article in articles:
-        category = article.get("Category") or "Uncategorized"
+        category = canonical_category_name(article.get("Category", ""))
         if article["Publisher"] == BASELINE_PUBLISHER:
             baseline_counts[category] += 1
         else:
@@ -1051,9 +1128,9 @@ PAGE = """
       white-space: nowrap;
     }
     .publisher-daily-star {
-      background: #e8f4ef;
-      border-color: #9fd2bf;
-      color: #115e59;
+      background: #eaf1fb;
+      border-color: #b8cdee;
+      color: #123b73;
     }
     .publisher-prothom-alo {
       background: #fff2ef;
@@ -1061,9 +1138,9 @@ PAGE = """
       color: #b42318;
     }
     .publisher-tbs {
-      background: #eef6fb;
-      border-color: #b5d7eb;
-      color: #195b84;
+      background: #eaf7ef;
+      border-color: #b6dec3;
+      color: #11643f;
     }
     .publisher-unknown {
       background: #f8f7f3;
@@ -1084,6 +1161,11 @@ PAGE = """
     .status-pill.gap { background: #fff2ef; border-color: #efc4bc; color: var(--danger); }
     .headline-cell { min-width: 340px; }
     .headline-cell a { font-weight: 700; }
+    .headline-link-daily-star { color: #123b73; }
+    .headline-link-prothom-alo { color: #b42318; }
+    .headline-link-tbs { color: #11643f; }
+    .headline-link-unknown { color: var(--accent-dark); }
+    .headline-cell a:hover { text-decoration-thickness: 2px; }
     .analysis-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1238,6 +1320,13 @@ PAGE = """
       return "publisher-unknown";
     }
 
+    function publisherHeadlineClass(value) {
+      if (value === "The Daily Star") return "headline-link-daily-star";
+      if (value === "Prothom Alo") return "headline-link-prothom-alo";
+      if (value === "The Business Standard" || value === "TBS") return "headline-link-tbs";
+      return "headline-link-unknown";
+    }
+
     function renderSummaryCards(data) {
       const baseline = pageConfig.baselinePublisher;
       const counts = data.publisher_counts || {};
@@ -1302,7 +1391,7 @@ PAGE = """
                 ${items.map((item) => `
                   <div class="signal-item">
                     <div class="meta">${item.publisher} | ${item.category} | ${ageText(item.published_time)}</div>
-                    <a href="${item.link}" target="_blank" rel="noreferrer">${item.headline}</a>
+                    <a class="${publisherHeadlineClass(item.publisher)}" href="${item.link}" target="_blank" rel="noreferrer">${item.headline}</a>
                   </div>
                 `).join("")}
               </div>
@@ -1319,7 +1408,7 @@ PAGE = """
           <td data-label="Published">${formatTime(article.PublishedTime)}</td>
           <td data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></td>
           <td data-label="Category"><span class="category-chip">${article.Category || "Uncategorized"}</span></td>
-          <td data-label="Headline" class="headline-cell"><a href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a></td>
+          <td data-label="Headline" class="headline-cell"><a class="${publisherHeadlineClass(article.Publisher)}" href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a></td>
         </tr>
       `).join("");
     }
@@ -1420,7 +1509,7 @@ PAGE = """
           <td data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></td>
           <td data-label="Publisher"><span class="tag">${article.Publisher}</span></td>
           <td data-label="Category"><span class="category-chip">${article.Category || "Uncategorized"}</span></td>
-          <td data-label="Headline" class="headline-cell"><a href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a></td>
+          <td data-label="Headline" class="headline-cell"><a class="${publisherHeadlineClass(article.Publisher)}" href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a></td>
         </tr>
       `).join("");
 
@@ -1503,10 +1592,10 @@ PAGE = """
                   <td data-label="Similarity">${(item.similarity || 0).toFixed(2)}</td>
                   <td data-label="Confidence">${(item.match_confidence || 0).toFixed(2)}<div class="meta">${item.match_reason || ""}</div></td>
                   <td data-label="Category"><span class="category-chip">${item.Category || "Uncategorized"}</span></td>
-                  <td data-label="Competitor story" class="headline-cell"><a href="${item.Link}" target="_blank" rel="noreferrer">${item.Headline}</a></td>
+                  <td data-label="Competitor story" class="headline-cell"><a class="${publisherHeadlineClass(item.Publisher)}" href="${item.Link}" target="_blank" rel="noreferrer">${item.Headline}</a></td>
                   <td data-label="Best Daily Star match" class="headline-cell">
                     ${item.best_match_link
-                      ? `<a href="${item.best_match_link}" target="_blank" rel="noreferrer">${item.best_match_headline}</a><div class="meta">${item.best_match_category || ""}</div>`
+                      ? `<a class="${publisherHeadlineClass(pageConfig.baselinePublisher)}" href="${item.best_match_link}" target="_blank" rel="noreferrer">${item.best_match_headline}</a><div class="meta">${item.best_match_category || ""}</div>`
                       : '<span class="meta">No baseline match found</span>'}
                   </td>
                 </tr>
