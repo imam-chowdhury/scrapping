@@ -53,6 +53,7 @@ OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 SOURCE_PUBLISHERS = publisher_order()
 PUBLISHER_ORDER = [BASELINE_PUBLISHER] + [name for name in SOURCE_PUBLISHERS if name != BASELINE_PUBLISHER]
 COMPETITOR_PUBLISHERS = [name for name in PUBLISHER_ORDER if name != BASELINE_PUBLISHER]
+ACTION_STATUSES = ("New", "Watching", "Assigned", "Reported", "Ignored")
 CATEGORY_ALIASES = {
     "Politics / রাজনীতি": {
         "politics",
@@ -125,6 +126,7 @@ state: Dict = {
     "embedding_cache": {},
     "match_cache": {},
     "comparison": {},
+    "actions": {},
 }
 
 
@@ -229,12 +231,73 @@ def shared_category_breakdown(articles: List[Dict], limit: int = 8) -> List[Dict
     return rows[:limit]
 
 
+def action_payload(value: Optional[Dict]) -> Dict[str, str]:
+    value = value or {}
+    status = value.get("status") or "New"
+    if status not in ACTION_STATUSES:
+        status = "New"
+    return {"status": status, "note": str(value.get("note") or "")[:500]}
+
+
+def action_for_link(actions: Dict[str, Dict], link: str) -> Dict[str, str]:
+    return action_payload((actions or {}).get(link))
+
+
+def enrich_articles(articles: List[Dict], actions: Dict[str, Dict], comparison: Optional[Dict] = None) -> List[Dict]:
+    enriched = []
+    for article in articles:
+        row = dict(article)
+        canonical = canonical_category_name(row.get("Category", ""))
+        action = action_for_link(actions, row.get("Link", ""))
+        row["CanonicalCategory"] = canonical
+        row["ActionStatus"] = action["status"]
+        row["ActionNote"] = action["note"]
+        enriched.append(row)
+    return enriched
+
+
+def command_metrics(articles: List[Dict]) -> Dict[str, int]:
+    cutoff = dhaka_now() - timedelta(minutes=15)
+    new_items = 0
+    competitor_only = 0
+    daily_star_last_hour = 0
+    active_actions = 0
+    categories_with_baseline = {
+        article.get("CanonicalCategory")
+        for article in articles
+        if article.get("Publisher") == BASELINE_PUBLISHER
+    }
+
+    for article in articles:
+        try:
+            published = parse_time(article["PublishedTime"])
+        except (KeyError, ValueError):
+            continue
+        if published >= cutoff:
+            new_items += 1
+        if article.get("Publisher") == BASELINE_PUBLISHER and published >= dhaka_now() - timedelta(hours=LIVE_HOURS):
+            daily_star_last_hour += 1
+        if article.get("Publisher") != BASELINE_PUBLISHER and article.get("CanonicalCategory") not in categories_with_baseline:
+            competitor_only += 1
+        if article.get("ActionStatus") in {"Watching", "Assigned"}:
+            active_actions += 1
+
+    return {
+        "new_15m": new_items,
+        "competitor_only": competitor_only,
+        "daily_star_last_hour": daily_star_last_hour,
+        "active_actions": active_actions,
+    }
+
+
 def live_signal(articles: List[Dict]) -> List[Dict]:
     return [
         {
             "headline": article["Headline"],
             "publisher": article["Publisher"],
             "category": article.get("Category") or "Uncategorized",
+            "canonical_category": article.get("CanonicalCategory") or canonical_category_name(article.get("Category", "")),
+            "action_status": article.get("ActionStatus", "New"),
             "published_time": article["PublishedTime"],
             "link": article["Link"],
         }
@@ -686,13 +749,15 @@ def feed_snapshot(hours: float) -> Dict:
     with state_lock:
         state["articles"] = prune_articles(state["articles"])
         base_articles = list(state["articles"])
+        comparison = dict(state.get("comparison") or empty_comparison(status="disabled"))
+        actions = dict(state.get("actions") or {})
         last_updated = state["last_updated"]
         next_run = state["next_run"]
         refreshing = state["refreshing"]
         error = state["error"]
 
-    articles = filter_recent_articles(base_articles, hours)
-    live_articles = filter_recent_articles(base_articles, LIVE_HOURS)
+    articles = enrich_articles(filter_recent_articles(base_articles, hours), actions, comparison)
+    live_articles = enrich_articles(filter_recent_articles(base_articles, LIVE_HOURS), actions, comparison)
     competitor_total = sum(
         count for publisher, count in sorted_publisher_counts(articles).items() if publisher != BASELINE_PUBLISHER
     )
@@ -709,6 +774,7 @@ def feed_snapshot(hours: float) -> Dict:
         "last_hour_counts": sorted_publisher_counts(live_articles),
         "top_categories": top_categories(articles),
         "live_signal": live_signal(live_articles),
+        "command_metrics": command_metrics(live_articles),
         "baseline_publisher": BASELINE_PUBLISHER,
         "publishers": PUBLISHER_ORDER,
         "competitor_total": competitor_total,
@@ -721,6 +787,9 @@ def analysis_snapshot(hours: float) -> Dict:
 
     with state_lock:
         comparison = dict(state.get("comparison") or empty_comparison(status="disabled"))
+        actions = dict(state.get("actions") or {})
+
+    coverage_gaps = enrich_articles(comparison.get("coverage_gaps", []), actions, comparison)
 
     publisher_summaries = []
     for publisher in PUBLISHER_ORDER:
@@ -757,7 +826,7 @@ def analysis_snapshot(hours: float) -> Dict:
         "baseline_publisher": BASELINE_PUBLISHER,
         "comparison_status": comparison.get("comparison_status", "disabled"),
         "comparison_error": comparison.get("comparison_error"),
-        "coverage_gaps": comparison.get("coverage_gaps", []),
+        "coverage_gaps": coverage_gaps,
         "comparison_summary": comparison.get("comparison_summary", {}),
         "missed_by_source": comparison.get("missed_by_source", []),
         "category_pressure": comparison.get("category_pressure", []),
@@ -779,6 +848,7 @@ def save_state() -> None:
                 "embedding_cache": state.get("embedding_cache", {}),
                 "match_cache": state.get("match_cache", {}),
                 "comparison": state.get("comparison", {}),
+                "actions": state.get("actions", {}),
             },
             file,
             ensure_ascii=False,
@@ -804,6 +874,11 @@ def load_state() -> None:
         state["embedding_cache"] = prune_embedding_cache(payload.get("embedding_cache", {}), articles)
         state["match_cache"] = prune_match_cache(payload.get("match_cache", {}))
         state["comparison"] = payload.get("comparison") or empty_comparison(status="disabled")
+        state["actions"] = {
+            str(link): action_payload(value)
+            for link, value in (payload.get("actions") or {}).items()
+            if link
+        }
 
 
 def refresh_news() -> None:
@@ -1017,8 +1092,12 @@ PAGE = """
     }
     .page-grid {
       display: grid;
-      grid-template-columns: minmax(0, 1.8fr) minmax(320px, 0.9fr);
+      grid-template-columns: minmax(760px, 1fr) minmax(300px, 360px);
       gap: 16px;
+      align-items: start;
+    }
+    .live-layout {
+      grid-template-columns: minmax(780px, 1fr) minmax(300px, 360px);
     }
     .stack { display: grid; gap: 16px; }
     .panel-header {
@@ -1059,6 +1138,9 @@ PAGE = """
     .publisher-stack, .panel-body, .analysis-block {
       padding: 0 18px 18px;
     }
+    .publisher-stack {
+      overflow-x: auto;
+    }
     .publisher-section + .publisher-section { margin-top: 18px; }
     .publisher-heading {
       display: flex;
@@ -1077,6 +1159,7 @@ PAGE = """
     }
     table {
       width: 100%;
+      min-width: 760px;
       border-collapse: collapse;
       background: var(--panel);
       border: 1px solid rgba(102,112,133,0.12);
@@ -1097,6 +1180,30 @@ PAGE = """
       color: var(--muted);
     }
     tr:last-child td { border-bottom: 0; }
+    #compareResults table {
+      min-width: 0;
+      table-layout: fixed;
+    }
+    #compareResults th:nth-child(1), #compareResults td:nth-child(1) { width: 15%; }
+    #compareResults th:nth-child(2), #compareResults td:nth-child(2) { width: 12%; }
+    #compareResults th:nth-child(3), #compareResults td:nth-child(3) { width: 8%; }
+    #compareResults th:nth-child(4), #compareResults td:nth-child(4) { width: 15%; }
+    #compareResults th:nth-child(5), #compareResults td:nth-child(5) { width: 35%; }
+    #compareResults th:nth-child(6), #compareResults td:nth-child(6) { width: 15%; }
+    #compareResults th,
+    #compareResults td {
+      overflow-wrap: anywhere;
+    }
+    #compareResults .publication-pill,
+    #compareResults .category-chip {
+      min-width: 0;
+      max-width: 100%;
+      white-space: normal;
+      line-height: 1.2;
+    }
+    #compareResults .action-box {
+      min-width: 0;
+    }
     .age, .tag, .status-pill {
       display: inline-flex;
       align-items: center;
@@ -1159,6 +1266,276 @@ PAGE = """
     .status-pill.covered { background: #e8f4ef; border-color: #b8ddd2; color: #115e59; }
     .status-pill.review { background: #fff2df; border-color: #f1c88b; color: var(--warning); }
     .status-pill.gap { background: #fff2ef; border-color: #efc4bc; color: var(--danger); }
+    .filter-segments {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .filter-dropdown {
+      position: relative;
+      width: min(260px, 100%);
+      flex: 0 0 260px;
+    }
+    .filter-dropdown-button {
+      width: 100%;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: white;
+      color: var(--text);
+      padding: 0 14px;
+      font-size: 14px;
+      font-weight: 700;
+      box-shadow: none;
+    }
+    .filter-dropdown-button span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .filter-dropdown-button::after {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-right: 2px solid var(--muted);
+      border-bottom: 2px solid var(--muted);
+      transform: rotate(45deg) translateY(-2px);
+      flex: 0 0 auto;
+    }
+    .filter-dropdown.open .filter-dropdown-button::after {
+      transform: rotate(225deg) translateY(-1px);
+    }
+    .filter-menu {
+      position: absolute;
+      z-index: 20;
+      top: calc(100% + 6px);
+      left: 0;
+      width: 100%;
+      max-height: 260px;
+      overflow-y: auto;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: white;
+      box-shadow: 0 18px 36px rgba(41, 34, 24, 0.18);
+    }
+    .filter-dropdown:not(.open) .filter-menu {
+      display: none;
+    }
+    .filter-option {
+      width: 100%;
+      min-height: 34px;
+      height: auto;
+      display: block;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text);
+      padding: 8px 10px;
+      text-align: left;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .filter-option:hover,
+    .filter-option.active {
+      background: var(--panel-alt);
+      color: var(--accent-dark);
+    }
+    .filter-chip {
+      height: 38px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: white;
+      color: var(--muted);
+      padding: 0 13px;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .filter-chip.active {
+      background: var(--text);
+      border-color: var(--text);
+      color: white;
+    }
+    .action-box {
+      display: grid;
+      gap: 6px;
+      min-width: 170px;
+    }
+    .action-box input {
+      width: 100%;
+      min-width: 0;
+      height: 32px;
+      border-radius: 7px;
+      font-size: 12px;
+      padding: 0 9px;
+    }
+    .action-box input { flex: none; }
+    .action-status-picker {
+      position: relative;
+      display: grid;
+      gap: 4px;
+    }
+    .action-status-button {
+      width: 100%;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: white;
+      color: var(--text);
+      padding: 0 9px;
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: none;
+    }
+    .action-status-button span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .action-status-button::after {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 2px solid var(--muted);
+      border-bottom: 2px solid var(--muted);
+      transform: rotate(45deg) translateY(-2px);
+      flex: 0 0 auto;
+    }
+    .action-status-picker.open .action-status-button::after {
+      transform: rotate(225deg) translateY(-1px);
+    }
+    .action-status-menu {
+      display: none;
+      position: fixed;
+      z-index: 60;
+      width: min(184px, calc(100vw - 24px));
+      gap: 3px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: white;
+      box-shadow: 0 16px 34px rgba(41, 34, 24, 0.2);
+    }
+    .action-status-picker.open .action-status-menu {
+      display: grid;
+    }
+    .action-status-option {
+      width: 100%;
+      height: 28px;
+      border: 0;
+      border-radius: 5px;
+      background: transparent;
+      color: var(--text);
+      padding: 0 7px;
+      text-align: left;
+      font-size: 12px;
+      font-weight: 700;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .action-status-option:hover,
+    .action-status-option.active {
+      background: var(--panel-alt);
+      color: var(--accent-dark);
+    }
+    .live-feed {
+      border: 1px solid rgba(102,112,133,0.12);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--panel);
+    }
+    .live-feed-head,
+    .live-feed-row {
+      display: grid;
+      grid-template-columns: 86px 128px 128px minmax(0, 1fr) 146px;
+      gap: 12px;
+      align-items: start;
+      padding: 12px;
+    }
+    .live-feed-head {
+      background: var(--panel-alt);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+    }
+    .live-feed-row {
+      border-top: 1px solid rgba(102,112,133,0.12);
+    }
+    .live-feed-row > div { min-width: 0; }
+    .live-feed-row .publication-pill {
+      min-width: 0;
+      max-width: 100%;
+      white-space: normal;
+      text-align: center;
+      line-height: 1.15;
+    }
+    .live-feed-row .category-chip {
+      max-width: 100%;
+      white-space: normal;
+      justify-content: flex-start;
+      border-radius: 16px;
+      line-height: 1.2;
+    }
+    .live-feed-row .headline-cell a {
+      overflow-wrap: anywhere;
+    }
+    .live-feed-row .action-box {
+      min-width: 0;
+      max-width: 146px;
+    }
+    .live-feed-row .action-box input {
+      height: 30px;
+    }
+    .command-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+    .command-card {
+      background: var(--panel);
+      border: 1px solid rgba(102,112,133,0.14);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 15px 16px;
+    }
+    .command-card strong {
+      display: block;
+      font-size: 28px;
+      line-height: 1;
+      margin-bottom: 7px;
+    }
+    .command-card span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .command-card em {
+      display: block;
+      margin-top: 7px;
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-style: normal;
+      font-weight: 700;
+    }
     .headline-cell { min-width: 340px; }
     .headline-cell a { font-weight: 700; }
     .headline-link-daily-star { color: #123b73; }
@@ -1227,14 +1604,62 @@ PAGE = """
       border-top: 1px solid rgba(102,112,133,0.1);
     }
     @media (max-width: 1180px) {
-      .summary-grid, .analysis-grid, .page-grid {
+      .summary-grid, .analysis-grid, .page-grid, .command-grid {
+        grid-template-columns: 1fr;
+      }
+      .live-layout {
         grid-template-columns: 1fr;
       }
     }
     @media (max-width: 760px) {
       .header-row { flex-direction: column; }
       .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolbar {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+      .filter-dropdown {
+        width: 100%;
+        flex-basis: auto;
+      }
+      .filter-menu {
+        width: 100%;
+        max-height: 280px;
+      }
+      input, select {
+        width: 100%;
+        min-width: 0;
+      }
+      .live-feed-head { display: none; }
+      .live-feed {
+        border: 0;
+        background: transparent;
+        display: grid;
+        gap: 10px;
+      }
+      .live-feed-row {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid rgba(102,112,133,0.12);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+      .live-feed-row > div::before {
+        content: attr(data-label);
+        display: block;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 800;
+        text-transform: uppercase;
+        margin-bottom: 3px;
+      }
+      .live-feed-row .action-box {
+        max-width: none;
+      }
       table, thead, tbody, tr, th, td { display: block; }
+      table { min-width: 0; }
       thead { display: none; }
       td {
         border-bottom: 0;
@@ -1327,6 +1752,149 @@ PAGE = """
       return "headline-link-unknown";
     }
 
+    function escapeHtml(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function actionControl(article) {
+      const link = escapeHtml(article.Link || "");
+      const status = article.ActionStatus || "New";
+      const note = escapeHtml(article.ActionNote || "");
+      const statuses = ["New", "Watching", "Assigned", "Reported", "Ignored"];
+      return `
+        <div class="action-box" data-link="${link}" data-status="${escapeHtml(status)}">
+          <div class="action-status-picker">
+            <button type="button" class="action-status-button" aria-haspopup="listbox" aria-expanded="false">
+              <span>${escapeHtml(status)}</span>
+            </button>
+            <div class="action-status-menu" role="listbox">
+              ${statuses.map((item) => `<button type="button" class="action-status-option ${item === status ? "active" : ""}" data-status="${item}">${item}</button>`).join("")}
+            </div>
+          </div>
+          <input class="action-note" type="text" value="${note}" placeholder="Note">
+        </div>
+      `;
+    }
+
+    function sortByTime(rows) {
+      return [...rows].sort((left, right) => {
+        return new Date(right.PublishedTime) - new Date(left.PublishedTime);
+      });
+    }
+
+    function beatOptions(articles) {
+      return [...new Set((articles || []).map((article) => article.CanonicalCategory || article.Category || "Uncategorized"))]
+        .filter(Boolean)
+        .sort((left, right) => left.localeCompare(right));
+    }
+
+    function placeActionMenu(picker) {
+      const button = picker.querySelector(".action-status-button");
+      const menu = picker.querySelector(".action-status-menu");
+      const rect = button.getBoundingClientRect();
+      const menuWidth = Math.min(184, window.innerWidth - 24);
+      const left = Math.min(Math.max(12, rect.left), window.innerWidth - menuWidth - 12);
+      menu.style.width = `${menuWidth}px`;
+      menu.style.left = `${left}px`;
+      menu.style.top = `${rect.bottom + 6}px`;
+      const menuHeight = menu.getBoundingClientRect().height || 70;
+      if (rect.bottom + 6 + menuHeight > window.innerHeight - 12) {
+        menu.style.top = `${Math.max(12, rect.top - menuHeight - 6)}px`;
+      }
+    }
+
+    function closeOpenMenus() {
+      document.querySelectorAll(".action-status-picker.open").forEach((picker) => {
+        picker.classList.remove("open");
+        picker.querySelector(".action-status-button")?.setAttribute("aria-expanded", "false");
+      });
+      document.querySelectorAll(".filter-dropdown.open").forEach((dropdown) => {
+        dropdown.classList.remove("open");
+        dropdown.querySelector(".filter-dropdown-button")?.setAttribute("aria-expanded", "false");
+      });
+    }
+
+    function updateLocalAction(link, action) {
+      const collections = [
+        feedData && feedData.articles,
+        feedData && feedData.live_signal,
+        analysisData && analysisData.coverage_gaps
+      ];
+      collections.forEach((items) => {
+        (items || []).forEach((item) => {
+          const itemLink = item.Link || item.link;
+          if (itemLink === link) {
+            item.ActionStatus = action.status;
+            item.ActionNote = action.note;
+            item.action_status = action.status;
+          }
+        });
+      });
+    }
+
+    async function saveAction(link, status, note) {
+      const response = await fetch("/api/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ link, status, note })
+      });
+      const payload = await response.json();
+      if (payload.ok) {
+        updateLocalAction(link, payload.action);
+      }
+      return payload;
+    }
+
+    function bindActionControls(root = document) {
+      root.querySelectorAll(".action-box").forEach((box) => {
+        const picker = box.querySelector(".action-status-picker");
+        const statusButton = box.querySelector(".action-status-button");
+        const statusLabel = statusButton.querySelector("span");
+        const note = box.querySelector(".action-note");
+        const persist = () => saveAction(box.dataset.link, box.dataset.status || "New", note.value).catch(() => {});
+        statusButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          document.querySelectorAll(".filter-dropdown.open").forEach((dropdown) => {
+            dropdown.classList.remove("open");
+            dropdown.querySelector(".filter-dropdown-button")?.setAttribute("aria-expanded", "false");
+          });
+          document.querySelectorAll(".action-status-picker.open").forEach((item) => {
+            if (item !== picker) {
+              item.classList.remove("open");
+              item.querySelector(".action-status-button")?.setAttribute("aria-expanded", "false");
+            }
+          });
+          const open = !picker.classList.contains("open");
+          picker.classList.toggle("open", open);
+          statusButton.setAttribute("aria-expanded", open ? "true" : "false");
+          if (open) {
+            placeActionMenu(picker);
+          }
+        });
+        box.querySelectorAll(".action-status-option").forEach((option) => {
+          option.addEventListener("click", (event) => {
+            event.stopPropagation();
+            box.dataset.status = option.dataset.status || "New";
+            statusLabel.textContent = box.dataset.status;
+            box.querySelectorAll(".action-status-option").forEach((item) => item.classList.toggle("active", item === option));
+            picker.classList.remove("open");
+            statusButton.setAttribute("aria-expanded", "false");
+            persist();
+          });
+        });
+        note.addEventListener("change", persist);
+      });
+    }
+
+    document.addEventListener("click", closeOpenMenus);
+    window.addEventListener("scroll", closeOpenMenus, true);
+    window.addEventListener("resize", closeOpenMenus);
+
     function renderSummaryCards(data) {
       const baseline = pageConfig.baselinePublisher;
       const counts = data.publisher_counts || {};
@@ -1407,14 +1975,23 @@ PAGE = """
           <td data-label="Publisher"><span class="publication-pill ${publisherClass(article.Publisher)}">${article.Publisher}</span></td>
           <td data-label="Published">${formatTime(article.PublishedTime)}</td>
           <td data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></td>
-          <td data-label="Category"><span class="category-chip">${article.Category || "Uncategorized"}</span></td>
+          <td data-label="Category"><span class="category-chip">${article.CanonicalCategory || article.Category || "Uncategorized"}</span></td>
           <td data-label="Headline" class="headline-cell"><a class="${publisherHeadlineClass(article.Publisher)}" href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a></td>
+          <td data-label="Action">${actionControl(article)}</td>
         </tr>
       `).join("");
     }
 
     function renderCompareView(data) {
-      const options = pageConfig.publishers.map((name) => `<option value="${name}">${name}</option>`).join("");
+      const beats = beatOptions(data.articles || []);
+      let selectedBeat = "";
+      let selectedPublisher = "";
+      const beatOptionsHtml = ["", ...beats].map((name) => `
+        <button type="button" class="filter-option ${name ? "" : "active"}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
+      `).join("");
+      const publisherOptionsHtml = ["", ...pageConfig.publishers].map((name) => `
+        <button type="button" class="filter-option ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name || "All publishers"}</button>
+      `).join("");
       content.innerHTML = `
         <section class="page-grid">
           <section class="panel">
@@ -1426,10 +2003,18 @@ PAGE = """
             </div>
             <div class="toolbar">
               <input id="search" type="search" placeholder="Search headline, category, publisher">
-              <select id="publisher">
-                <option value="">All publishers</option>
-                ${options}
-              </select>
+              <div class="filter-dropdown" id="compareBeat">
+                <button type="button" class="filter-dropdown-button" aria-haspopup="listbox" aria-expanded="false">
+                  <span>All beats</span>
+                </button>
+                <div class="filter-menu" role="listbox">${beatOptionsHtml}</div>
+              </div>
+              <div class="filter-dropdown" id="comparePublisher">
+                <button type="button" class="filter-dropdown-button" aria-haspopup="listbox" aria-expanded="false">
+                  <span>All publishers</span>
+                </button>
+                <div class="filter-menu" role="listbox">${publisherOptionsHtml}</div>
+              </div>
             </div>
             <div class="publisher-stack" id="compareResults"></div>
           </section>
@@ -1458,15 +2043,21 @@ PAGE = """
       `;
 
       const search = document.getElementById("search");
-      const publisher = document.getElementById("publisher");
+      const beat = document.getElementById("compareBeat");
+      const beatButton = beat.querySelector(".filter-dropdown-button");
+      const beatLabel = beatButton.querySelector("span");
+      const publisher = document.getElementById("comparePublisher");
+      const publisherButton = publisher.querySelector(".filter-dropdown-button");
+      const publisherLabel = publisherButton.querySelector("span");
       const compareResults = document.getElementById("compareResults");
 
       function paintCompare() {
         const term = search.value.trim().toLowerCase();
-        const selectedPublisher = publisher.value;
         const filtered = (data.articles || []).filter((article) => {
-          const text = `${article.Headline} ${article.Category} ${article.Publisher}`.toLowerCase();
-          return (!selectedPublisher || article.Publisher === selectedPublisher) &&
+          const text = `${article.Headline} ${article.Category} ${article.CanonicalCategory} ${article.Publisher}`.toLowerCase();
+          const beatName = article.CanonicalCategory || article.Category || "Uncategorized";
+          return (!selectedBeat || beatName === selectedBeat) &&
+            (!selectedPublisher || article.Publisher === selectedPublisher) &&
             (!term || text.includes(term));
         }).sort((left, right) => new Date(right.PublishedTime) - new Date(left.PublishedTime));
 
@@ -1489,58 +2080,144 @@ PAGE = """
                   <th>Age</th>
                   <th>Category</th>
                   <th>Headline</th>
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody>${compareTableRows(filtered)}</tbody>
             </table>
           </section>
         `;
+        bindActionControls(compareResults);
       }
 
       search.addEventListener("input", paintCompare);
-      publisher.addEventListener("change", paintCompare);
+      beatButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        document.querySelectorAll(".action-status-picker.open").forEach((picker) => {
+          picker.classList.remove("open");
+          picker.querySelector(".action-status-button")?.setAttribute("aria-expanded", "false");
+        });
+        if (publisher.classList.contains("open")) {
+          publisher.classList.remove("open");
+          publisherButton.setAttribute("aria-expanded", "false");
+        }
+        const open = !beat.classList.contains("open");
+        beat.classList.toggle("open", open);
+        beatButton.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+      beat.querySelectorAll(".filter-option").forEach((option) => {
+        option.addEventListener("click", (event) => {
+          event.stopPropagation();
+          selectedBeat = option.dataset.beat || "";
+          beatLabel.textContent = selectedBeat || "All beats";
+          beat.querySelectorAll(".filter-option").forEach((item) => item.classList.toggle("active", item === option));
+          beat.classList.remove("open");
+          beatButton.setAttribute("aria-expanded", "false");
+          paintCompare();
+        });
+      });
+      publisherButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        document.querySelectorAll(".action-status-picker.open").forEach((picker) => {
+          picker.classList.remove("open");
+          picker.querySelector(".action-status-button")?.setAttribute("aria-expanded", "false");
+        });
+        if (beat.classList.contains("open")) {
+          beat.classList.remove("open");
+          beatButton.setAttribute("aria-expanded", "false");
+        }
+        const open = !publisher.classList.contains("open");
+        publisher.classList.toggle("open", open);
+        publisherButton.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+      publisher.querySelectorAll(".filter-option").forEach((option) => {
+        option.addEventListener("click", (event) => {
+          event.stopPropagation();
+          selectedPublisher = option.dataset.publisher || "";
+          publisherLabel.textContent = selectedPublisher || "All publishers";
+          publisher.querySelectorAll(".filter-option").forEach((item) => item.classList.toggle("active", item === option));
+          publisher.classList.remove("open");
+          publisherButton.setAttribute("aria-expanded", "false");
+          paintCompare();
+        });
+      });
       paintCompare();
     }
 
     function renderLiveView(data) {
-      const rows = (data.articles || []).map((article) => `
-        <tr>
-          <td data-label="Published">${formatTime(article.PublishedTime)}</td>
-          <td data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></td>
-          <td data-label="Publisher"><span class="tag">${article.Publisher}</span></td>
-          <td data-label="Category"><span class="category-chip">${article.Category || "Uncategorized"}</span></td>
-          <td data-label="Headline" class="headline-cell"><a class="${publisherHeadlineClass(article.Publisher)}" href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a></td>
-        </tr>
+      const metrics = data.command_metrics || {};
+      const beats = beatOptions(data.articles || []);
+      let selectedBeat = "";
+      let selectedPublisher = "";
+      const beatOptionsHtml = ["", ...beats].map((name) => `
+        <button type="button" class="filter-option ${name ? "" : "active"}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
+      `).join("");
+      const publisherChips = ["", ...pageConfig.publishers].map((name) => `
+        <button type="button" class="filter-chip ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name || "All publishers"}</button>
       `).join("");
 
       content.innerHTML = `
-        <section class="page-grid">
+        <section class="command-grid">
+          <article class="command-card">
+            <strong>${metrics.new_15m || 0}</strong>
+            <span>New in 15m</span>
+            <em>Fresh movement</em>
+          </article>
+          <article class="command-card">
+            <strong>${metrics.competitor_only || 0}</strong>
+            <span>Competitor-only</span>
+            <em>No Daily Star beat match</em>
+          </article>
+          <article class="command-card">
+            <strong>${metrics.daily_star_last_hour || 0}</strong>
+            <span>Daily Star 1h</span>
+            <em>Baseline pace</em>
+          </article>
+          <article class="command-card">
+            <strong>${metrics.active_actions || 0}</strong>
+            <span>Watching/assigned</span>
+            <em>Desk action queue</em>
+          </article>
+        </section>
+        <section class="page-grid live-layout">
           <section class="panel">
             <div class="panel-header">
               <div>
-                <h2>Live wire</h2>
-                <p>One-hour mixed stream to catch breaking moves quickly.</p>
+                <h2>Reporter command</h2>
+                <p>Newest-first factual live feed for deciding what to watch, assign, or report now.</p>
               </div>
             </div>
-            ${rows ? `
-              <div class="publisher-stack">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Published</th>
-                      <th>Age</th>
-                      <th>Publisher</th>
-                      <th>Category</th>
-                      <th>Headline</th>
-                    </tr>
-                  </thead>
-                  <tbody>${rows}</tbody>
-                </table>
+            <div class="toolbar">
+              <input id="liveSearch" type="search" placeholder="Search live feed">
+              <div class="filter-dropdown" id="liveBeat">
+                <button type="button" class="filter-dropdown-button" aria-haspopup="listbox" aria-expanded="false">
+                  <span>All beats</span>
+                </button>
+                <div class="filter-menu" role="listbox">${beatOptionsHtml}</div>
               </div>
-            ` : '<div class="empty">No articles in the last 1 hour.</div>'}
+              <div class="filter-segments" id="livePublisher">${publisherChips}</div>
+            </div>
+            <div class="publisher-stack" id="liveResults"></div>
           </section>
           <section class="stack">
-            ${renderSignalCard(data.live_signal || [])}
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Hot beats</h3>
+                  <p>Where the last hour is concentrating.</p>
+                </div>
+              </div>
+              <div class="analysis-block">
+                <div class="analysis-list">
+                  ${(data.top_categories || []).slice(0, 6).map((item) => `
+                    <div class="analysis-row">
+                      <strong>${item.name}</strong>
+                      <span>${item.count} articles</span>
+                    </div>
+                  `).join("")}
+                </div>
+              </div>
+            </section>
             <section class="panel">
               <div class="panel-header">
                 <div>
@@ -1553,15 +2230,89 @@ PAGE = """
                   ${pageConfig.publishers.map((name) => `
                     <div class="analysis-row">
                       <strong>${name}</strong>
-                      <span>${(data.publisher_counts || {})[name] || 0} articles in 1h</span>
+                      <span>${(data.publisher_counts || {})[name] || 0} articles</span>
                     </div>
                   `).join("")}
                 </div>
               </div>
             </section>
+            ${renderSignalCard(data.live_signal || [])}
           </section>
         </section>
       `;
+
+      const search = document.getElementById("liveSearch");
+      const beat = document.getElementById("liveBeat");
+      const beatButton = beat.querySelector(".filter-dropdown-button");
+      const beatLabel = beatButton.querySelector("span");
+      const publisher = document.getElementById("livePublisher");
+      const liveResults = document.getElementById("liveResults");
+
+      function liveRows(rows) {
+        return rows.map((article) => `
+          <article class="live-feed-row">
+            <div data-label="Published">${formatTime(article.PublishedTime)}<br><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></div>
+            <div data-label="Publisher"><span class="publication-pill ${publisherClass(article.Publisher)}">${article.Publisher}</span></div>
+            <div data-label="Beat"><span class="category-chip">${article.CanonicalCategory || article.Category || "Uncategorized"}</span></div>
+            <div data-label="Headline" class="headline-cell">
+              <a class="${publisherHeadlineClass(article.Publisher)}" href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a>
+            </div>
+            <div data-label="Action">${actionControl(article)}</div>
+          </article>
+        `).join("");
+      }
+
+      function paintLive() {
+        const term = search.value.trim().toLowerCase();
+        const rows = sortByTime((data.articles || []).filter((article) => {
+          const text = `${article.Headline} ${article.Category} ${article.CanonicalCategory} ${article.Publisher}`.toLowerCase();
+          const beatName = article.CanonicalCategory || article.Category || "Uncategorized";
+          return (!selectedBeat || beatName === selectedBeat) &&
+            (!selectedPublisher || article.Publisher === selectedPublisher) &&
+            (!term || text.includes(term));
+        }));
+
+        liveResults.innerHTML = rows.length ? `
+          <div class="live-feed">
+            <div class="live-feed-head">
+              <span>Published</span>
+              <span>Publisher</span>
+              <span>Beat</span>
+              <span>Headline</span>
+              <span>Action</span>
+            </div>
+            ${liveRows(rows)}
+          </div>
+        ` : '<div class="empty">No live items match these filters.</div>';
+        bindActionControls(liveResults);
+      }
+
+      search.addEventListener("input", paintLive);
+      beatButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const open = !beat.classList.contains("open");
+        beat.classList.toggle("open", open);
+        beatButton.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+      beat.querySelectorAll(".filter-option").forEach((option) => {
+        option.addEventListener("click", (event) => {
+          event.stopPropagation();
+          selectedBeat = option.dataset.beat || "";
+          beatLabel.textContent = selectedBeat || "All beats";
+          beat.querySelectorAll(".filter-option").forEach((item) => item.classList.toggle("active", item === option));
+          beat.classList.remove("open");
+          beatButton.setAttribute("aria-expanded", "false");
+          paintLive();
+        });
+      });
+      publisher.querySelectorAll(".filter-chip").forEach((chip) => {
+        chip.addEventListener("click", () => {
+          selectedPublisher = chip.dataset.publisher || "";
+          publisher.querySelectorAll(".filter-chip").forEach((item) => item.classList.toggle("active", item === chip));
+          paintLive();
+        });
+      });
+      paintLive();
     }
 
     function renderCoverageRows(rows) {
@@ -1581,6 +2332,7 @@ PAGE = """
                 <th>Category</th>
                 <th>Competitor story</th>
                 <th>Best Daily Star match</th>
+                <th>Action</th>
               </tr>
             </thead>
             <tbody>
@@ -1591,13 +2343,14 @@ PAGE = """
                   <td data-label="Status"><span class="${statusClass(item.status)}">${item.status}</span></td>
                   <td data-label="Similarity">${(item.similarity || 0).toFixed(2)}</td>
                   <td data-label="Confidence">${(item.match_confidence || 0).toFixed(2)}<div class="meta">${item.match_reason || ""}</div></td>
-                  <td data-label="Category"><span class="category-chip">${item.Category || "Uncategorized"}</span></td>
+                  <td data-label="Category"><span class="category-chip">${item.CanonicalCategory || item.Category || "Uncategorized"}</span></td>
                   <td data-label="Competitor story" class="headline-cell"><a class="${publisherHeadlineClass(item.Publisher)}" href="${item.Link}" target="_blank" rel="noreferrer">${item.Headline}</a></td>
                   <td data-label="Best Daily Star match" class="headline-cell">
                     ${item.best_match_link
                       ? `<a class="${publisherHeadlineClass(pageConfig.baselinePublisher)}" href="${item.best_match_link}" target="_blank" rel="noreferrer">${item.best_match_headline}</a><div class="meta">${item.best_match_category || ""}</div>`
                       : '<span class="meta">No baseline match found</span>'}
                   </td>
+                  <td data-label="Action">${actionControl(item)}</td>
                 </tr>
               `).join("")}
             </tbody>
@@ -1608,7 +2361,7 @@ PAGE = """
 
     function renderAnalysisView(data) {
       const comparisonStatus = data.comparison_status || "disabled";
-      const gapRows = (data.coverage_gaps || []).filter((row) => row.status !== "Covered");
+      const gapRows = sortByTime((data.coverage_gaps || []).filter((row) => row.status !== "Covered"));
       const comparisonMessage = comparisonStatus === "disabled"
         ? "OpenAI exact matching is disabled. Add OPENAI_API_KEY to enable Daily Star gap analysis."
         : comparisonStatus === "error"
@@ -1772,6 +2525,7 @@ PAGE = """
           </section>
         </section>
       `;
+      bindActionControls(content);
     }
 
     async function loadData() {
@@ -1870,6 +2624,31 @@ def api_news():
 def api_analysis():
     requested_hours = request.args.get("hours", default=WINDOW_HOURS, type=float)
     return jsonify(analysis_snapshot(requested_hours))
+
+
+@app.get("/api/actions")
+def api_actions():
+    with state_lock:
+        return jsonify({"actions": state.get("actions", {})})
+
+
+@app.post("/api/actions")
+def api_update_action():
+    payload = request.get_json(silent=True) or {}
+    link = str(payload.get("link") or "").strip()
+    if not link:
+        return jsonify({"ok": False, "error": "Missing article link."}), 400
+
+    action = action_payload({"status": payload.get("status"), "note": payload.get("note")})
+    with state_lock:
+        actions = dict(state.get("actions") or {})
+        if action["status"] == "New" and not action["note"]:
+            actions.pop(link, None)
+        else:
+            actions[link] = action
+        state["actions"] = actions
+        save_state()
+    return jsonify({"ok": True, "link": link, "action": action})
 
 
 @app.post("/api/refresh")
