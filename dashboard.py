@@ -1611,7 +1611,7 @@ PAGE = """
         grid-template-columns: 1fr;
       }
     }
-    @media (max-width: 760px) {
+    @media (max-width: 900px) {
       .header-row { flex-direction: column; }
       .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .toolbar {
@@ -1661,9 +1661,20 @@ PAGE = """
       table, thead, tbody, tr, th, td { display: block; }
       table { min-width: 0; }
       thead { display: none; }
+      tbody {
+        display: grid;
+        gap: 10px;
+      }
+      tr {
+        border: 1px solid rgba(102,112,133,0.12);
+        border-radius: 8px;
+        background: var(--panel);
+        overflow: hidden;
+      }
       td {
         border-bottom: 0;
         padding: 6px 12px;
+        width: 100% !important;
       }
       td::before {
         content: attr(data-label);
@@ -1671,6 +1682,29 @@ PAGE = """
         color: var(--muted);
         font-size: 12px;
         margin-bottom: 3px;
+      }
+      #compareResults table {
+        border: 0;
+        background: transparent;
+      }
+      #compareResults th,
+      #compareResults td {
+        width: 100% !important;
+      }
+      #compareResults .publisher-section {
+        margin-bottom: 0;
+      }
+      #compareResults .headline-cell {
+        min-width: 0;
+      }
+      #compareResults .action-box {
+        width: 100%;
+        min-width: 0;
+      }
+      #compareResults .action-status-picker,
+      #compareResults .action-status-button,
+      #compareResults .action-note {
+        width: 100%;
       }
       .publisher-heading, .analysis-row { flex-direction: column; align-items: flex-start; }
       .headline-cell { min-width: 0; }
@@ -1892,7 +1926,13 @@ PAGE = """
     }
 
     document.addEventListener("click", closeOpenMenus);
-    window.addEventListener("scroll", closeOpenMenus, true);
+    window.addEventListener("scroll", (event) => {
+      const target = event.target;
+      if (target && target.closest && target.closest(".filter-menu")) {
+        return;
+      }
+      closeOpenMenus();
+    }, true);
     window.addEventListener("resize", closeOpenMenus);
 
     function renderSummaryCards(data) {
