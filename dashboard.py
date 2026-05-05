@@ -64,9 +64,15 @@ CATEGORY_ALIASES = {
         "bangladesh",
         "national",
         "nation",
+        "country",
+        "whole country",
+        "capital",
         "বাংলাদেশ",
         "জাতীয়",
         "জাতীয়",
+        "সারাদেশ",
+        "রাজধানী",
+        "দেশের বার্তা",
     },
     "World / বিশ্ব": {
         "world",
@@ -74,11 +80,17 @@ CATEGORY_ALIASES = {
         "global",
         "বিশ্ব",
         "আন্তর্জাতিক",
+        "ইউরোপ",
+        "আফ্রিকা",
+        "দক্ষিণ এশিয়া",
+        "দক্ষিণ এশিয়া",
+        "মধ্যপ্রাচ্য",
     },
     "Business / বাণিজ্য": {
         "business",
         "economy",
         "economics",
+        "economic",
         "market",
         "markets",
         "trade",
@@ -92,12 +104,16 @@ CATEGORY_ALIASES = {
         "game",
         "games",
         "খেলা",
+        "ফুটবল",
+        "ক্রিকেট",
         "ক্রীড়া",
         "ক্রীড়া",
     },
     "Entertainment / বিনোদন": {
         "entertainment",
         "showbiz",
+        "talkies",
+        "ott",
         "culture",
         "arts",
         "বিনোদন",
@@ -106,6 +122,7 @@ CATEGORY_ALIASES = {
     "Technology / প্রযুক্তি": {
         "technology",
         "tech",
+        "scitech",
         "startup",
         "startups",
         "প্রযুক্তি",
@@ -1055,6 +1072,7 @@ PAGE = """
       border: 1px solid rgba(102,112,133,0.14);
       border-radius: 8px;
       box-shadow: var(--shadow);
+      min-width: 0;
     }
     .summary-card { padding: 16px; }
     .summary-card strong {
@@ -1100,6 +1118,12 @@ PAGE = """
       grid-template-columns: minmax(780px, 1fr) minmax(300px, 360px);
     }
     .stack { display: grid; gap: 16px; }
+    .page-grid > *,
+    .command-grid > *,
+    .analysis-grid > *,
+    .stack > * {
+      min-width: 0;
+    }
     .panel-header {
       display: flex;
       justify-content: space-between;
@@ -1204,6 +1228,82 @@ PAGE = """
     #compareResults .action-box {
       min-width: 0;
     }
+    .publisher-count-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+      gap: 8px;
+      width: 100%;
+      min-width: 0;
+    }
+    .publisher-count-chip {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 9px;
+      background: #fff;
+    }
+    .publisher-count-chip .publisher-count-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .publisher-count-chip .publisher-count-value {
+      min-width: 24px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.74);
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .publisher-count-chip.publisher-daily-star {
+      background: #eaf1fb;
+      border-color: #b8cdee;
+    }
+    .publisher-count-chip.publisher-prothom-alo {
+      background: #fff2ef;
+      border-color: #efc4bc;
+    }
+    .publisher-count-chip.publisher-tbs {
+      background: #eaf7ef;
+      border-color: #b6dec3;
+    }
+    .publisher-count-chip.publisher-samakal {
+      background: #f4ecfb;
+      border-color: #d8bfef;
+    }
+    .publisher-count-chip.publisher-bonik-barta {
+      background: #fff4e8;
+      border-color: #e9c59b;
+    }
+    .publisher-count-chip.publisher-unknown {
+      background: #f8f7f3;
+    }
+    .hourly-table {
+      min-width: 0;
+      table-layout: fixed;
+    }
+    .hourly-table th:nth-child(1),
+    .hourly-table td:nth-child(1) {
+      width: 22%;
+    }
+    .hourly-table th:nth-child(2),
+    .hourly-table td:nth-child(2) {
+      width: 12%;
+    }
+    .hourly-table th:nth-child(3),
+    .hourly-table td:nth-child(3) {
+      width: 66%;
+    }
     .age, .tag, .status-pill {
       display: inline-flex;
       align-items: center;
@@ -1248,6 +1348,16 @@ PAGE = """
       background: #eaf7ef;
       border-color: #b6dec3;
       color: #11643f;
+    }
+    .publisher-samakal {
+      background: #f4ecfb;
+      border-color: #d8bfef;
+      color: #64328f;
+    }
+    .publisher-bonik-barta {
+      background: #fff4e8;
+      border-color: #e9c59b;
+      color: #8a4a10;
     }
     .publisher-unknown {
       background: #f8f7f3;
@@ -1541,6 +1651,8 @@ PAGE = """
     .headline-link-daily-star { color: #123b73; }
     .headline-link-prothom-alo { color: #b42318; }
     .headline-link-tbs { color: #11643f; }
+    .headline-link-samakal { color: #64328f; }
+    .headline-link-bonik-barta { color: #8a4a10; }
     .headline-link-unknown { color: var(--accent-dark); }
     .headline-cell a:hover { text-decoration-thickness: 2px; }
     .analysis-grid {
@@ -1570,6 +1682,10 @@ PAGE = """
       color: var(--muted);
       font-size: 13px;
     }
+    .analysis-row .publisher-count-grid {
+      flex: 1 1 360px;
+      max-width: 560px;
+    }
     .signal-list {
       display: grid;
       gap: 10px;
@@ -1587,6 +1703,12 @@ PAGE = """
       display: block;
       margin: 5px 0;
       font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .signal-item .meta,
+    .analysis-row strong,
+    .analysis-row span {
+      overflow-wrap: anywhere;
     }
     .note {
       padding: 14px 16px;
@@ -1683,6 +1805,15 @@ PAGE = """
         font-size: 12px;
         margin-bottom: 3px;
       }
+      .publisher-count-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .publisher-count-chip {
+        padding: 6px 8px;
+      }
+      .publisher-count-chip .publisher-count-name {
+        font-size: 11px;
+      }
       #compareResults table {
         border: 0;
         background: transparent;
@@ -1707,6 +1838,10 @@ PAGE = """
         width: 100%;
       }
       .publisher-heading, .analysis-row { flex-direction: column; align-items: flex-start; }
+      .analysis-row .publisher-count-grid {
+        flex-basis: auto;
+        max-width: none;
+      }
       .headline-cell { min-width: 0; }
     }
   </style>
@@ -1776,6 +1911,8 @@ PAGE = """
       if (value === "The Daily Star") return "publisher-daily-star";
       if (value === "Prothom Alo") return "publisher-prothom-alo";
       if (value === "The Business Standard" || value === "TBS") return "publisher-tbs";
+      if (value === "Samakal") return "publisher-samakal";
+      if (value === "Bonik Barta") return "publisher-bonik-barta";
       return "publisher-unknown";
     }
 
@@ -1783,6 +1920,8 @@ PAGE = """
       if (value === "The Daily Star") return "headline-link-daily-star";
       if (value === "Prothom Alo") return "headline-link-prothom-alo";
       if (value === "The Business Standard" || value === "TBS") return "headline-link-tbs";
+      if (value === "Samakal") return "headline-link-samakal";
+      if (value === "Bonik Barta") return "headline-link-bonik-barta";
       return "headline-link-unknown";
     }
 
@@ -1825,6 +1964,23 @@ PAGE = """
       return [...new Set((articles || []).map((article) => article.CanonicalCategory || article.Category || "Uncategorized"))]
         .filter(Boolean)
         .sort((left, right) => left.localeCompare(right));
+    }
+
+    function publisherLabel(name) {
+      return name === "The Business Standard" ? "TBS" : name;
+    }
+
+    function publisherCountGrid(source) {
+      return `
+        <div class="publisher-count-grid">
+          ${pageConfig.publishers.map((name) => `
+            <div class="publisher-count-chip ${publisherClass(name)}" title="${escapeHtml(name)}">
+              <span class="publisher-count-name">${escapeHtml(publisherLabel(name))}</span>
+              <span class="publisher-count-value">${source[name] || 0}</span>
+            </div>
+          `).join("")}
+        </div>
+      `;
     }
 
     function placeActionMenu(picker) {
@@ -1948,8 +2104,12 @@ PAGE = """
         { value: data.count || 0, label: `Last ${data.window_hours}h total`, note: `${liveTotal} in the last 1h` },
         { value: counts[baseline] || 0, label: baseline, note: `${liveCounts[baseline] || 0} in the last 1h` },
         { value: competitorTotal, label: "Competitors", note: `${pageConfig.competitors.join(", ")}` },
-        { value: counts["Prothom Alo"] || 0, label: "Prothom Alo", note: `${liveCounts["Prothom Alo"] || 0} in the last 1h` },
-        { value: counts["The Business Standard"] || 0, label: "TBS", note: topCategory ? `${topCategory.name} leads with ${topCategory.count}` : "No category yet" }
+        ...pageConfig.competitors.map((name) => ({
+          value: counts[name] || 0,
+          label: publisherLabel(name),
+          note: `${liveCounts[name] || 0} in the last 1h`
+        })),
+        { value: topCategory ? topCategory.count : 0, label: "Hot beat", note: topCategory ? topCategory.name : "No category yet" }
       ];
 
       summaryGrid.innerHTML = cards.map((card) => `
@@ -2519,12 +2679,12 @@ PAGE = """
                 </div>
               </div>
               ${(data.hourly_breakdown || []).length ? `
-                <table>
+                <table class="hourly-table">
                   <thead>
                     <tr>
                       <th>Hour</th>
                       <th>Total</th>
-                      ${pageConfig.publishers.map((name) => `<th>${name}</th>`).join("")}
+                      <th>Publishers</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2532,7 +2692,7 @@ PAGE = """
                       <tr>
                         <td data-label="Hour">${item.label}</td>
                         <td data-label="Total">${item.total}</td>
-                        ${pageConfig.publishers.map((name) => `<td data-label="${name}">${item[name] || 0}</td>`).join("")}
+                        <td data-label="Publishers">${publisherCountGrid(item)}</td>
                       </tr>
                     `).join("")}
                   </tbody>
@@ -2556,7 +2716,7 @@ PAGE = """
                         <strong>${item.category}</strong>
                         <span>${item.total} total</span>
                       </div>
-                      <span>${pageConfig.publishers.map((name) => `${name}: ${(item.publishers || {})[name] || 0}`).join(" | ")}</span>
+                      ${publisherCountGrid(item.publishers || {})}
                     </div>
                   `).join("")}
                 </div>
@@ -2629,7 +2789,7 @@ def index():
     return render_page(
         "compare",
         "Reporter News Dashboard",
-        "Five-hour all-publication timeline for seeing The Daily Star, Prothom Alo, and TBS with the newest story first.",
+        "Five-hour all-publication timeline across every tracked publisher, with the newest story first.",
         WINDOW_HOURS,
     )
 

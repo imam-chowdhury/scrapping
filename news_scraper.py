@@ -149,6 +149,29 @@ def parse_compact_age_minutes(text: str) -> Optional[int]:
     return parse_relative_minutes(text)
 
 
+def parse_site_datetime(value: str, default_tz=DHAKA) -> Optional[datetime]:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+
+    normalized = cleaned.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z"):
+            try:
+                parsed = datetime.strptime(normalized, pattern)
+                break
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=default_tz)
+    return parsed.astimezone(DHAKA)
+
+
 def cached_article(link: str, article_cache: Optional[Dict[str, Dict[str, str]]]) -> Optional[Dict[str, str]]:
     if not article_cache:
         return None
@@ -527,10 +550,201 @@ def scrape_tbs(cutoff: datetime, max_pages: int = 10, article_cache: Optional[Di
     return articles
 
 
+def samakal_category_from_link(link: str) -> str:
+    segments = [segment for segment in urlparse(link).path.split("/") if segment]
+    if segments:
+        return normalize_category(segments[0])
+    return ""
+
+
+def extract_samakal_article(link: str, fallback_headline: str, cutoff: datetime) -> Optional[Dict[str, str]]:
+    try:
+        soup = BeautifulSoup(fetch_html(link), "html.parser")
+    except requests.RequestException:
+        return None
+
+    headline = fallback_headline
+    published = None
+    category = samakal_category_from_link(link)
+    summary = meta_description(soup)
+    snippet = ""
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.get_text(strip=True))
+        except json.JSONDecodeError:
+            continue
+
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if node.get("@type") == "NewsArticle":
+                headline = clean_text(node.get("headline") or headline)
+                category = clean_text(node.get("articleSection") or category)
+                summary = clean_text(node.get("description") or summary)
+                snippet = clean_text(node.get("articleBody") or snippet)
+                published = parse_site_datetime(node.get("datePublished", ""))
+            elif node.get("@type") == "BreadcrumbList":
+                breadcrumb_names = []
+                for item in node.get("itemListElement", []):
+                    name = clean_text(item.get("name") if isinstance(item, dict) else "")
+                    if name and name.lower() != "home":
+                        breadcrumb_names.append(name)
+                if len(breadcrumb_names) > 1:
+                    category = breadcrumb_names[-2]
+
+    if not headline:
+        title = soup.select_one("h1")
+        headline = clean_text(title.get_text(" ", strip=True) if title else "")
+    if not snippet:
+        snippet = body_snippet(soup, "article p, .news-details p, .details p, .DNewsDetails p, .content p")
+
+    if not published or not headline or published < cutoff:
+        return None
+
+    return {
+        "Headline": headline,
+        "Link": link,
+        "PublishedTime": published.isoformat(),
+        "Publisher": "Samakal",
+        "Category": category,
+        "Summary": summary,
+        "BodySnippet": snippet or summary,
+    }
+
+
+def samakal_latest_candidates(page_url: str) -> Iterable[Tuple[str, str]]:
+    soup = BeautifulSoup(fetch_html(page_url), "html.parser")
+    seen = set()
+    for anchor in soup.select('a[href*="/article/"]'):
+        href = anchor.get("href")
+        if not href:
+            continue
+        link = urljoin("https://samakal.com/", href)
+        if link in seen or not re.search(r"/article/\d+/", urlparse(link).path):
+            continue
+        headline = clean_text(anchor.get_text(" ", strip=True), limit=250)
+        seen.add(link)
+        yield link, headline
+
+
+def scrape_samakal(cutoff: datetime, max_pages: int = 4, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
+    articles: List[Dict[str, str]] = []
+    seen = set()
+
+    for page in range(1, max_pages + 1):
+        page_url = "https://samakal.com/latest/news" if page == 1 else f"https://samakal.com/latest/news?page={page}"
+        candidates = list(samakal_latest_candidates(page_url))
+        if not candidates:
+            break
+
+        oldest_on_page: Optional[datetime] = None
+        for link, headline in candidates:
+            if link in seen:
+                continue
+            seen.add(link)
+
+            cached = cached_article(link, article_cache)
+            if cached and cached.get("Publisher") == "Samakal":
+                cached_published = datetime.fromisoformat(cached["PublishedTime"]).astimezone(DHAKA)
+                oldest_on_page = cached_published if oldest_on_page is None else min(oldest_on_page, cached_published)
+                if cached_published >= cutoff and has_match_context(cached):
+                    articles.append(cached)
+                continue
+
+            article = extract_samakal_article(link, headline, cutoff)
+            if not article:
+                continue
+            if article_cache is not None:
+                article_cache[link] = article
+
+            published = datetime.fromisoformat(article["PublishedTime"]).astimezone(DHAKA)
+            oldest_on_page = published if oldest_on_page is None else min(oldest_on_page, published)
+            articles.append(article)
+
+        if oldest_on_page is not None and oldest_on_page < cutoff:
+            break
+
+    return articles
+
+
+BONIK_BARTA_FILTER_IDS = (52, 41)
+
+
+def bonik_barta_link(url_path: str) -> str:
+    parts = [part for part in (url_path or "").split("/") if part]
+    if not parts:
+        return "https://www.bonikbarta.com/"
+    if parts[0] == "en":
+        return "https://en.bonikbarta.com/" + "/".join(parts[1:])
+    if parts[0] == "home":
+        return "https://www.bonikbarta.com/" + "/".join(parts[1:])
+    return "https://www.bonikbarta.com/" + "/".join(parts)
+
+
+def scrape_bonik_barta(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
+    articles: List[Dict[str, str]] = []
+    seen = set()
+
+    for filter_id in BONIK_BARTA_FILTER_IDS:
+        payload = fetch_json(f"https://www.bonikbarta.com/api/post-filters/{filter_id}")
+        posts = payload.get("posts") or []
+        if not posts:
+            continue
+
+        oldest_on_filter: Optional[datetime] = None
+        for post in posts:
+            published = parse_site_datetime(post.get("first_published_at", ""))
+            title = clean_text(post.get("title", ""), limit=300)
+            url_path = post.get("url_path", "")
+            if not published or not title or not url_path:
+                continue
+
+            oldest_on_filter = published if oldest_on_filter is None else min(oldest_on_filter, published)
+            if published < cutoff:
+                continue
+
+            link = bonik_barta_link(url_path)
+            if link in seen:
+                continue
+            seen.add(link)
+
+            cached = cached_article(link, article_cache)
+            if cached and cached.get("Publisher") == "Bonik Barta" and has_match_context(cached):
+                articles.append(cached)
+                continue
+
+            summary = clean_text(BeautifulSoup(post.get("summary") or "", "html.parser").get_text(" ", strip=True))
+            article = {
+                "Headline": title,
+                "Link": link,
+                "PublishedTime": published.isoformat(),
+                "Publisher": "Bonik Barta",
+                "Category": clean_text(
+                    post.get("primary_category_title")
+                    or post.get("primary_category_slug")
+                    or (urlparse(link).path.split("/")[1] if len(urlparse(link).path.split("/")) > 1 else "")
+                ),
+                "Summary": summary,
+                "BodySnippet": summary,
+            }
+            if article_cache is not None:
+                article_cache[link] = article
+            articles.append(article)
+
+        if oldest_on_filter is not None and oldest_on_filter < cutoff:
+            break
+
+    return articles
+
+
 SOURCE_REGISTRY: List[Dict[str, object]] = [
     {"id": "daily_star", "publisher": "The Daily Star", "scraper": scrape_daily_star},
     {"id": "prothomalo", "publisher": "Prothom Alo", "scraper": scrape_prothomalo},
     {"id": "tbs", "publisher": "The Business Standard", "scraper": scrape_tbs},
+    {"id": "samakal", "publisher": "Samakal", "scraper": scrape_samakal},
+    {"id": "bonik_barta", "publisher": "Bonik Barta", "scraper": scrape_bonik_barta},
 ]
 
 SOURCE_LOOKUP = {source["id"]: source for source in SOURCE_REGISTRY}
