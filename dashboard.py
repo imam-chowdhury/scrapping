@@ -1237,7 +1237,7 @@ PAGE = """
     }
     .publisher-count-chip {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: auto minmax(0, 1fr) auto;
       align-items: center;
       gap: 8px;
       min-width: 0;
@@ -1245,6 +1245,19 @@ PAGE = """
       border-radius: 8px;
       padding: 7px 9px;
       background: #fff;
+    }
+    .publisher-logo {
+      width: 18px;
+      height: 18px;
+      flex: 0 0 18px;
+      object-fit: contain;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.8);
+    }
+    .publisher-count-chip .publisher-logo {
+      width: 16px;
+      height: 16px;
+      flex-basis: 16px;
     }
     .publisher-count-chip .publisher-count-name {
       min-width: 0;
@@ -1326,6 +1339,7 @@ PAGE = """
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      gap: 7px;
       min-width: 118px;
       border-radius: 999px;
       padding: 5px 10px;
@@ -1333,6 +1347,11 @@ PAGE = """
       font-weight: 800;
       border: 1px solid var(--line);
       white-space: nowrap;
+    }
+    .publication-pill .publisher-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .publisher-daily-star {
       background: #eaf1fb;
@@ -1925,6 +1944,30 @@ PAGE = """
       return "headline-link-unknown";
     }
 
+    function publisherLogo(value) {
+      if (value === "The Daily Star") return "https://www.thedailystar.net/themes/custom/swallow/favicon.ico";
+      if (value === "Prothom Alo") return "https://www.prothomalo.com/favicon.ico";
+      if (value === "The Business Standard" || value === "TBS") return "https://www.tbsnews.net/favicon.ico";
+      if (value === "Samakal") return "https://samakal.com/frontend/media/common/favicon/favicon-32x32.png";
+      if (value === "Bonik Barta") return "https://www.bonikbarta.com/favicon.webp";
+      return "";
+    }
+
+    function publisherLogoMarkup(name) {
+      const logo = publisherLogo(name);
+      if (!logo) return "";
+      return `<img class="publisher-logo" src="${logo}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">`;
+    }
+
+    function publisherPill(name) {
+      return `
+        <span class="publication-pill ${publisherClass(name)}" title="${escapeHtml(name)}">
+          ${publisherLogoMarkup(name)}
+          <span class="publisher-name">${escapeHtml(name)}</span>
+        </span>
+      `;
+    }
+
     function escapeHtml(value) {
       return String(value || "")
         .replace(/&/g, "&amp;")
@@ -1975,6 +2018,7 @@ PAGE = """
         <div class="publisher-count-grid">
           ${pageConfig.publishers.map((name) => `
             <div class="publisher-count-chip ${publisherClass(name)}" title="${escapeHtml(name)}">
+              ${publisherLogoMarkup(name)}
               <span class="publisher-count-name">${escapeHtml(publisherLabel(name))}</span>
               <span class="publisher-count-value">${source[name] || 0}</span>
             </div>
@@ -2172,7 +2216,7 @@ PAGE = """
     function compareTableRows(rows) {
       return rows.map((article) => `
         <tr>
-          <td data-label="Publisher"><span class="publication-pill ${publisherClass(article.Publisher)}">${article.Publisher}</span></td>
+          <td data-label="Publisher">${publisherPill(article.Publisher)}</td>
           <td data-label="Published">${formatTime(article.PublishedTime)}</td>
           <td data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></td>
           <td data-label="Category"><span class="category-chip">${article.CanonicalCategory || article.Category || "Uncategorized"}</span></td>
@@ -2452,7 +2496,7 @@ PAGE = """
         return rows.map((article) => `
           <article class="live-feed-row">
             <div data-label="Published">${formatTime(article.PublishedTime)}<br><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></div>
-            <div data-label="Publisher"><span class="publication-pill ${publisherClass(article.Publisher)}">${article.Publisher}</span></div>
+            <div data-label="Publisher">${publisherPill(article.Publisher)}</div>
             <div data-label="Beat"><span class="category-chip">${article.CanonicalCategory || article.Category || "Uncategorized"}</span></div>
             <div data-label="Headline" class="headline-cell">
               <a class="${publisherHeadlineClass(article.Publisher)}" href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a>
@@ -2538,7 +2582,7 @@ PAGE = """
             <tbody>
               ${rows.map((item) => `
                 <tr>
-                  <td data-label="Publisher"><span class="tag">${item.Publisher}</span></td>
+                  <td data-label="Publisher">${publisherPill(item.Publisher)}</td>
                   <td data-label="Published">${formatTime(item.PublishedTime)}<br><span class="meta">${ageText(item.PublishedTime)}</span></td>
                   <td data-label="Status"><span class="${statusClass(item.status)}">${item.status}</span></td>
                   <td data-label="Similarity">${(item.similarity || 0).toFixed(2)}</td>
@@ -2563,7 +2607,7 @@ PAGE = """
       const comparisonStatus = data.comparison_status || "disabled";
       const gapRows = sortByTime((data.coverage_gaps || []).filter((row) => row.status !== "Covered"));
       const comparisonMessage = comparisonStatus === "disabled"
-        ? "OpenAI exact matching is disabled. Add OPENAI_API_KEY to enable Daily Star gap analysis."
+        ? "Exact matching is disabled"
         : comparisonStatus === "error"
           ? `OpenAI exact matching failed. Showing last saved results. ${data.comparison_error || ""}`
           : "Exact coverage matching is active. Embeddings shortlist candidates, then OpenAI confirms only same-event matches as covered.";
