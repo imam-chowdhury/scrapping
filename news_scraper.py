@@ -1,5 +1,6 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html import unescape
 import json
 import os
 import random
@@ -100,7 +101,7 @@ def normalize_category(value: str) -> str:
 
 
 def clean_text(value: str, limit: int = 1200) -> str:
-    return " ".join((value or "").split())[:limit]
+    return " ".join(unescape(value or "").split())[:limit]
 
 
 def meta_description(soup: BeautifulSoup) -> str:
@@ -557,6 +558,13 @@ def samakal_category_from_link(link: str) -> str:
     return ""
 
 
+def path_category_from_link(link: str) -> str:
+    segments = [segment for segment in urlparse(link).path.split("/") if segment]
+    if not segments:
+        return ""
+    return normalize_category(segments[0])
+
+
 def extract_samakal_article(link: str, fallback_headline: str, cutoff: datetime) -> Optional[Dict[str, str]]:
     try:
         soup = BeautifulSoup(fetch_html(link), "html.parser")
@@ -739,12 +747,216 @@ def scrape_bonik_barta(cutoff: datetime, article_cache: Optional[Dict[str, Dict[
     return articles
 
 
+def decode_embedded_js_value(value: str) -> str:
+    cleaned = (
+        (value or "")
+        .replace(r"\/", "/")
+        .replace(r"\u0026", "&")
+        .replace(r"\"", '"')
+        .replace(r"\n", " ")
+        .replace(r"\r", " ")
+        .replace(r"\t", " ")
+    )
+    return clean_text(cleaned)
+
+
+def escaped_js_field(chunk: str, field: str, limit: int = 1200) -> str:
+    match = re.search(rf'\\"{re.escape(field)}\\":\\"(.*?)\\"', chunk, re.DOTALL)
+    if not match:
+        return ""
+    return clean_text(decode_embedded_js_value(match.group(1)), limit=limit)
+
+
+def dhaka_post_time_from_image(image_url: str) -> Optional[datetime]:
+    match = re.search(r"(?<!\d)(20\d{12})(?!\d)", image_url or "")
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=DHAKA)
+    except ValueError:
+        return None
+
+
+def scrape_dhaka_post(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
+    html = fetch_html("https://www.dhakapost.com/")
+    articles: List[Dict[str, str]] = []
+    seen = set()
+
+    starts = [match.start() for match in re.finditer(r'\{\\"Heading\\":', html)]
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else start + 4000
+        chunk = html[start:end]
+
+        headline = escaped_js_field(chunk, "Heading", limit=300)
+        link = escaped_js_field(chunk, "URL", limit=500)
+        image_url = escaped_js_field(chunk, "ImagePath", limit=500)
+        if not headline or not link or link in seen:
+            continue
+        if "dhakapost.com" not in urlparse(link).netloc:
+            continue
+
+        category = path_category_from_link(link)
+        if category.lower() in {"jobs career", "jobs"}:
+            continue
+
+        published = dhaka_post_time_from_image(image_url)
+        if not published or published < cutoff:
+            continue
+
+        cached = cached_article(link, article_cache)
+        if cached and cached.get("Publisher") == "Dhaka Post" and has_match_context(cached):
+            articles.append(cached)
+            seen.add(link)
+            continue
+
+        summary = escaped_js_field(chunk, "Brief")
+        article = {
+            "Headline": headline,
+            "Link": link,
+            "PublishedTime": published.isoformat(),
+            "Publisher": "Dhaka Post",
+            "Category": category,
+            "Summary": summary,
+            "BodySnippet": summary,
+        }
+        if article_cache is not None:
+            article_cache[link] = article
+        seen.add(link)
+        articles.append(article)
+
+    return articles
+
+
+def json_ld_nodes(data) -> List[Dict]:
+    if isinstance(data, dict) and isinstance(data.get("@graph"), list):
+        data = data["@graph"]
+    if isinstance(data, list):
+        return [node for node in data if isinstance(node, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def json_ld_has_type(node: Dict, type_name: str) -> bool:
+    node_type = node.get("@type")
+    if isinstance(node_type, list):
+        return type_name in node_type
+    return node_type == type_name
+
+
+BDNEWS_SKIP_SECTIONS = {"image", "media-en", "tube", "hello"}
+
+
+BDNEWS_WORKERS = int(os.getenv("BDNEWS_WORKERS", "4"))
+
+
+def bdnews_latest_candidates(max_links: int = 35) -> List[str]:
+    soup = BeautifulSoup(fetch_html("https://bdnews24.com/"), "html.parser")
+    links: List[str] = []
+    seen = set()
+    for anchor in soup.select("a[href]"):
+        link = urljoin("https://bdnews24.com/", anchor.get("href", ""))
+        parsed = urlparse(link)
+        if parsed.netloc != "bdnews24.com":
+            continue
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if len(segments) < 2 or segments[0].lower() in BDNEWS_SKIP_SECTIONS:
+            continue
+        if not re.fullmatch(r"[0-9a-f]{8,}", segments[-1]):
+            continue
+        normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        links.append(normalized)
+        if len(links) >= max_links:
+            break
+    return links
+
+
+def extract_bdnews24_article(link: str, cutoff: datetime) -> Optional[Dict[str, str]]:
+    try:
+        soup = BeautifulSoup(fetch_html(link), "html.parser")
+    except requests.RequestException:
+        return None
+
+    headline = ""
+    published = None
+    summary = meta_description(soup)
+    snippet = ""
+    category = path_category_from_link(link)
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.get_text(strip=True))
+        except json.JSONDecodeError:
+            continue
+
+        for node in json_ld_nodes(data):
+            if not json_ld_has_type(node, "NewsArticle"):
+                continue
+            headline = clean_text(node.get("headline") or headline, limit=300)
+            summary = clean_text(node.get("description") or summary)
+            snippet = clean_text(node.get("articleBody") or snippet)
+            published = parse_site_datetime(node.get("datePublished", ""))
+
+    if not headline:
+        title = soup.select_one("h1")
+        headline = clean_text(title.get_text(" ", strip=True) if title else "", limit=300)
+    if not snippet:
+        snippet = body_snippet(soup, "article p, main p, .story-element p, .article-body p, p")
+
+    if not headline or not published or published < cutoff:
+        return None
+
+    return {
+        "Headline": headline,
+        "Link": link,
+        "PublishedTime": published.isoformat(),
+        "Publisher": "bdnews24.com",
+        "Category": category,
+        "Summary": summary,
+        "BodySnippet": snippet or summary,
+    }
+
+
+def scrape_bdnews24(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
+    articles: List[Dict[str, str]] = []
+    uncached_links: List[str] = []
+    for link in bdnews_latest_candidates():
+        cached = cached_article(link, article_cache)
+        if cached and cached.get("Publisher") == "bdnews24.com":
+            try:
+                cached_published = datetime.fromisoformat(cached["PublishedTime"]).astimezone(DHAKA)
+            except (KeyError, ValueError):
+                cached_published = None
+            if cached_published and cached_published >= cutoff and has_match_context(cached):
+                articles.append(cached)
+                continue
+
+        uncached_links.append(link)
+
+    with ThreadPoolExecutor(max_workers=max(1, BDNEWS_WORKERS)) as executor:
+        futures = {executor.submit(extract_bdnews24_article, link, cutoff): link for link in uncached_links}
+        for future in as_completed(futures):
+            article = future.result()
+            if not article:
+                continue
+            if article_cache is not None:
+                article_cache[futures[future]] = article
+            articles.append(article)
+
+    return articles
+
+
 SOURCE_REGISTRY: List[Dict[str, object]] = [
     {"id": "daily_star", "publisher": "The Daily Star", "scraper": scrape_daily_star},
     {"id": "prothomalo", "publisher": "Prothom Alo", "scraper": scrape_prothomalo},
     {"id": "tbs", "publisher": "The Business Standard", "scraper": scrape_tbs},
     {"id": "samakal", "publisher": "Samakal", "scraper": scrape_samakal},
     {"id": "bonik_barta", "publisher": "Bonik Barta", "scraper": scrape_bonik_barta},
+    {"id": "dhaka_post", "publisher": "Dhaka Post", "scraper": scrape_dhaka_post},
+    {"id": "bdnews24", "publisher": "bdnews24.com", "scraper": scrape_bdnews24},
 ]
 
 SOURCE_LOOKUP = {source["id"]: source for source in SOURCE_REGISTRY}

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
 from news_scraper import DHAKA, dhaka_now, publisher_order, scrape_sources
 
@@ -54,6 +54,22 @@ SOURCE_PUBLISHERS = publisher_order()
 PUBLISHER_ORDER = [BASELINE_PUBLISHER] + [name for name in SOURCE_PUBLISHERS if name != BASELINE_PUBLISHER]
 COMPETITOR_PUBLISHERS = [name for name in PUBLISHER_ORDER if name != BASELINE_PUBLISHER]
 ACTION_STATUSES = ("New", "Watching", "Assigned", "Reported", "Ignored")
+PUBLISHER_LOGO_URLS = {
+    "daily-star": "https://www.thedailystar.net/themes/custom/swallow/favicon.ico",
+    "prothom-alo": "https://www.prothomalo.com/favicon.ico",
+    "tbs": "https://www.tbsnews.net/favicon.ico",
+    "samakal": "https://samakal.com/frontend/media/common/favicon/favicon-32x32.png",
+    "bonik-barta": "https://www.bonikbarta.com/favicon.webp",
+    "dhaka-post": "https://cdn.dhakapost.com/config/favicon/favicon-32x32.png",
+    "bdnews24": "https://bdnews24.com/frontend/assets/images/common/favicon.png",
+}
+LOGO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+logo_cache: Dict[str, Tuple[bytes, str]] = {}
 CATEGORY_ALIASES = {
     "Politics / রাজনীতি": {
         "politics",
@@ -67,6 +83,10 @@ CATEGORY_ALIASES = {
         "country",
         "whole country",
         "capital",
+        "city",
+        "metro",
+        "crime",
+        "law crime",
         "বাংলাদেশ",
         "জাতীয়",
         "জাতীয়",
@@ -78,6 +98,10 @@ CATEGORY_ALIASES = {
         "world",
         "international",
         "global",
+        "middle east",
+        "neighbour",
+        "neighbours",
+        "asia",
         "বিশ্ব",
         "আন্তর্জাতিক",
         "ইউরোপ",
@@ -91,6 +115,12 @@ CATEGORY_ALIASES = {
         "economy",
         "economics",
         "economic",
+        "finance",
+        "banking",
+        "macro mirror",
+        "global economy",
+        "stock market",
+        "industry trade",
         "market",
         "markets",
         "trade",
@@ -126,6 +156,29 @@ CATEGORY_ALIASES = {
         "startup",
         "startups",
         "প্রযুক্তি",
+    },
+    "Health / স্বাস্থ্য": {
+        "health",
+        "healthcare",
+        "medical",
+        "স্বাস্থ্য",
+    },
+    "Education / শিক্ষা": {
+        "education",
+        "campus",
+        "শিক্ষা",
+    },
+    "Opinion / মতামত": {
+        "opinion",
+        "views",
+        "view",
+        "মতামত",
+    },
+    "Lifestyle / জীবনযাপন": {
+        "lifestyle",
+        "life style",
+        "fashion",
+        "জীবনযাপন",
     },
 }
 
@@ -242,9 +295,20 @@ def shared_category_breakdown(articles: List[Dict], limit: int = 8) -> List[Dict
     rows = []
     for category, counts in category_map.items():
         total = sum(counts.values())
-        rows.append({"category": category, "total": total, "publishers": counts})
+        leader, leader_count = max(counts.items(), key=lambda item: (item[1], item[0]))
+        active_publishers = sum(1 for count in counts.values() if count > 0)
+        rows.append(
+            {
+                "category": category,
+                "total": total,
+                "publishers": counts,
+                "leader": leader if leader_count else "",
+                "leader_count": leader_count,
+                "active_publishers": active_publishers,
+            }
+        )
 
-    rows.sort(key=lambda item: (item["total"], item["category"]), reverse=True)
+    rows.sort(key=lambda item: (item["active_publishers"], item["total"], item["category"]), reverse=True)
     return rows[:limit]
 
 
@@ -790,6 +854,7 @@ def feed_snapshot(hours: float) -> Dict:
         "publisher_counts": sorted_publisher_counts(articles),
         "last_hour_counts": sorted_publisher_counts(live_articles),
         "top_categories": top_categories(articles),
+        "shared_categories": shared_category_breakdown(articles),
         "live_signal": live_signal(live_articles),
         "command_metrics": command_metrics(live_articles),
         "baseline_publisher": BASELINE_PUBLISHER,
@@ -1230,7 +1295,7 @@ PAGE = """
     }
     .publisher-count-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
       gap: 8px;
       width: 100%;
       min-width: 0;
@@ -1297,6 +1362,14 @@ PAGE = """
     .publisher-count-chip.publisher-bonik-barta {
       background: #fff4e8;
       border-color: #e9c59b;
+    }
+    .publisher-count-chip.publisher-dhaka-post {
+      background: #e9f6fd;
+      border-color: #b6ddf3;
+    }
+    .publisher-count-chip.publisher-bdnews24 {
+      background: #fff0f1;
+      border-color: #efc2c7;
     }
     .publisher-count-chip.publisher-unknown {
       background: #f8f7f3;
@@ -1377,6 +1450,16 @@ PAGE = """
       background: #fff4e8;
       border-color: #e9c59b;
       color: #8a4a10;
+    }
+    .publisher-dhaka-post {
+      background: #e9f6fd;
+      border-color: #b6ddf3;
+      color: #0b5f89;
+    }
+    .publisher-bdnews24 {
+      background: #fff0f1;
+      border-color: #efc2c7;
+      color: #a01622;
     }
     .publisher-unknown {
       background: #f8f7f3;
@@ -1672,6 +1755,8 @@ PAGE = """
     .headline-link-tbs { color: #11643f; }
     .headline-link-samakal { color: #64328f; }
     .headline-link-bonik-barta { color: #8a4a10; }
+    .headline-link-dhaka-post { color: #0b5f89; }
+    .headline-link-bdnews24 { color: #a01622; }
     .headline-link-unknown { color: var(--accent-dark); }
     .headline-cell a:hover { text-decoration-thickness: 2px; }
     .analysis-grid {
@@ -1704,6 +1789,23 @@ PAGE = """
     .analysis-row .publisher-count-grid {
       flex: 1 1 360px;
       max-width: 560px;
+    }
+    .beat-row {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.2fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .beat-row-main {
+      min-width: 0;
+    }
+    .beat-row-main strong {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+    .beat-row-main span {
+      display: block;
+      margin-top: 4px;
     }
     .signal-list {
       display: grid;
@@ -1861,6 +1963,9 @@ PAGE = """
         flex-basis: auto;
         max-width: none;
       }
+      .beat-row {
+        grid-template-columns: 1fr;
+      }
       .headline-cell { min-width: 0; }
     }
   </style>
@@ -1932,6 +2037,8 @@ PAGE = """
       if (value === "The Business Standard" || value === "TBS") return "publisher-tbs";
       if (value === "Samakal") return "publisher-samakal";
       if (value === "Bonik Barta") return "publisher-bonik-barta";
+      if (value === "Dhaka Post") return "publisher-dhaka-post";
+      if (value === "bdnews24.com" || value === "bdnews24") return "publisher-bdnews24";
       return "publisher-unknown";
     }
 
@@ -1941,15 +2048,19 @@ PAGE = """
       if (value === "The Business Standard" || value === "TBS") return "headline-link-tbs";
       if (value === "Samakal") return "headline-link-samakal";
       if (value === "Bonik Barta") return "headline-link-bonik-barta";
+      if (value === "Dhaka Post") return "headline-link-dhaka-post";
+      if (value === "bdnews24.com" || value === "bdnews24") return "headline-link-bdnews24";
       return "headline-link-unknown";
     }
 
     function publisherLogo(value) {
-      if (value === "The Daily Star") return "https://www.thedailystar.net/themes/custom/swallow/favicon.ico";
-      if (value === "Prothom Alo") return "https://www.prothomalo.com/favicon.ico";
-      if (value === "The Business Standard" || value === "TBS") return "https://www.tbsnews.net/favicon.ico";
-      if (value === "Samakal") return "https://samakal.com/frontend/media/common/favicon/favicon-32x32.png";
-      if (value === "Bonik Barta") return "https://www.bonikbarta.com/favicon.webp";
+      if (value === "The Daily Star") return "/api/publisher-logo/daily-star";
+      if (value === "Prothom Alo") return "/api/publisher-logo/prothom-alo";
+      if (value === "The Business Standard" || value === "TBS") return "/api/publisher-logo/tbs";
+      if (value === "Samakal") return "/api/publisher-logo/samakal";
+      if (value === "Bonik Barta") return "/api/publisher-logo/bonik-barta";
+      if (value === "Dhaka Post") return "/api/publisher-logo/dhaka-post";
+      if (value === "bdnews24.com" || value === "bdnews24") return "/api/publisher-logo/bdnews24";
       return "";
     }
 
@@ -2010,7 +2121,14 @@ PAGE = """
     }
 
     function publisherLabel(name) {
-      return name === "The Business Standard" ? "TBS" : name;
+      const labels = {
+        "The Daily Star": "Daily Star",
+        "The Business Standard": "TBS",
+        "Prothom Alo": "Prothom",
+        "Bonik Barta": "Bonik",
+        "bdnews24.com": "bdnews24"
+      };
+      return labels[name] || name;
     }
 
     function publisherCountGrid(source) {
@@ -2021,6 +2139,26 @@ PAGE = """
               ${publisherLogoMarkup(name)}
               <span class="publisher-count-name">${escapeHtml(publisherLabel(name))}</span>
               <span class="publisher-count-value">${source[name] || 0}</span>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
+    function renderBeatPerformance(items, limit = 8) {
+      const rows = (items || []).slice(0, limit);
+      if (!rows.length) {
+        return '<div class="empty">No beat data yet.</div>';
+      }
+      return `
+        <div class="analysis-list">
+          ${rows.map((item) => `
+            <div class="analysis-row beat-row">
+              <div class="beat-row-main">
+                <strong>${escapeHtml(item.category)}</strong>
+                <span>${item.total || 0} total${item.leader ? `, leading: ${escapeHtml(publisherLabel(item.leader))} (${item.leader_count || 0})` : ""}</span>
+              </div>
+              ${publisherCountGrid(item.publishers || {})}
             </div>
           `).join("")}
         </div>
@@ -2147,7 +2285,7 @@ PAGE = """
       const cards = [
         { value: data.count || 0, label: `Last ${data.window_hours}h total`, note: `${liveTotal} in the last 1h` },
         { value: counts[baseline] || 0, label: baseline, note: `${liveCounts[baseline] || 0} in the last 1h` },
-        { value: competitorTotal, label: "Competitors", note: `${pageConfig.competitors.join(", ")}` },
+        { value: competitorTotal, label: "Competitors", note: `${pageConfig.competitors.length} tracked publishers` },
         ...pageConfig.competitors.map((name) => ({
           value: counts[name] || 0,
           label: publisherLabel(name),
@@ -2267,19 +2405,12 @@ PAGE = """
             <section class="panel">
               <div class="panel-header">
                 <div>
-                  <h3>Top categories</h3>
-                  <p>Where this window is concentrating coverage.</p>
+                  <h3>Beat performance</h3>
+                  <p>Same beats merged across Bangla and English labels.</p>
                 </div>
               </div>
               <div class="analysis-block">
-                <div class="analysis-list">
-                  ${(data.top_categories || []).map((item) => `
-                    <div class="analysis-row">
-                      <strong>${item.name}</strong>
-                      <span>${item.count} articles</span>
-                    </div>
-                  `).join("")}
-                </div>
+                ${renderBeatPerformance(data.shared_categories || [], 8)}
               </div>
             </section>
           </section>
@@ -2874,6 +3005,41 @@ def api_analysis():
 def api_actions():
     with state_lock:
         return jsonify({"actions": state.get("actions", {})})
+
+
+@app.get("/api/publisher-logo/<publisher_key>")
+def api_publisher_logo(publisher_key: str):
+    logo_url = PUBLISHER_LOGO_URLS.get(publisher_key)
+    if not logo_url:
+        return Response("Not found", status=404)
+
+    cached = logo_cache.get(publisher_key)
+    if cached:
+        content, content_type = cached
+        response = Response(content, mimetype=content_type)
+        response.headers["Cache-Control"] = "public, max-age=86400"
+        return response
+
+    try:
+        upstream = requests.get(logo_url, headers=LOGO_HEADERS, timeout=10)
+        upstream.raise_for_status()
+    except requests.RequestException:
+        return Response("Logo unavailable", status=502)
+
+    content_type = upstream.headers.get("content-type", "image/png").split(";")[0]
+    if not content_type.startswith("image/"):
+        return Response("Invalid logo", status=502)
+
+    content = upstream.content
+    logo_cache[publisher_key] = (content, content_type)
+    response = Response(content, mimetype=content_type)
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return api_publisher_logo("daily-star")
 
 
 @app.post("/api/actions")
