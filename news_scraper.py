@@ -87,6 +87,28 @@ def polite_get(url: str) -> requests.Response:
     raise last_error or RuntimeError(f"Failed to fetch {url}")
 
 
+def polite_post(url: str, *, headers: Optional[Dict[str, str]] = None, data: str = "") -> requests.Response:
+    last_error = None
+    request_headers = {**HEADERS, **(headers or {})}
+    for attempt in range(SCRAPE_MAX_RETRIES):
+        wait_for_host(url)
+        try:
+            response = requests.post(url, headers=request_headers, data=data, timeout=30)
+            if response.status_code in (403, 429):
+                raise ScrapeBlockedError(f"{response.status_code} from {url}")
+            if response.status_code >= 500 and attempt < SCRAPE_MAX_RETRIES - 1:
+                time.sleep(min(30, 2 ** attempt + random.uniform(0, 1)))
+                continue
+            response.raise_for_status()
+            return response
+        except (requests.RequestException, ScrapeBlockedError) as exc:
+            last_error = exc
+            if isinstance(exc, ScrapeBlockedError) or attempt == SCRAPE_MAX_RETRIES - 1:
+                raise
+            time.sleep(min(30, 2 ** attempt + random.uniform(0, 1)))
+    raise last_error or RuntimeError(f"Failed to post {url}")
+
+
 def fetch_json(url: str) -> Dict:
     return polite_get(url).json()
 
@@ -777,52 +799,158 @@ def dhaka_post_time_from_image(image_url: str) -> Optional[datetime]:
         return None
 
 
-def scrape_dhaka_post(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
-    html = fetch_html("https://www.dhakapost.com/")
-    articles: List[Dict[str, str]] = []
-    seen = set()
+def dhaka_post_article_from_row(row: Dict, cutoff: datetime) -> Optional[Dict[str, str]]:
+    headline = clean_text(row.get("Heading") or row.get("headline") or "", limit=300)
+    link = clean_text(row.get("URL") or row.get("url") or "", limit=500)
+    image_url = clean_text(
+        row.get("ImagePath")
+        or row.get("ImagePathSm")
+        or row.get("ImagePathMd")
+        or row.get("ImagePathXs")
+        or "",
+        limit=500,
+    )
+    if not headline or not link or "dhakapost.com" not in urlparse(link).netloc:
+        return None
 
+    category = path_category_from_link(link)
+    if category.lower() in {"jobs career", "jobs"}:
+        return None
+
+    published = dhaka_post_time_from_image(image_url)
+    if not published or published < cutoff:
+        return None
+
+    summary = clean_text(row.get("Brief") or row.get("brief") or "")
+    return {
+        "Headline": headline,
+        "Link": link,
+        "PublishedTime": published.isoformat(),
+        "Publisher": "Dhaka Post",
+        "Category": category,
+        "Summary": summary,
+        "BodySnippet": summary,
+    }
+
+
+def dhaka_post_rows_from_embedded_html(html: str) -> List[Dict]:
+    rows = []
     starts = [match.start() for match in re.finditer(r'\{\\"Heading\\":', html)]
     for index, start in enumerate(starts):
         end = starts[index + 1] if index + 1 < len(starts) else start + 4000
         chunk = html[start:end]
+        rows.append(
+            {
+                "Heading": escaped_js_field(chunk, "Heading", limit=300),
+                "URL": escaped_js_field(chunk, "URL", limit=500),
+                "ImagePath": (
+                    escaped_js_field(chunk, "ImagePath", limit=500)
+                    or escaped_js_field(chunk, "ImagePathSm", limit=500)
+                    or escaped_js_field(chunk, "ImagePathMd", limit=500)
+                    or escaped_js_field(chunk, "ImagePathXs", limit=500)
+                ),
+                "Brief": escaped_js_field(chunk, "Brief"),
+            }
+        )
+    return rows
 
-        headline = escaped_js_field(chunk, "Heading", limit=300)
-        link = escaped_js_field(chunk, "URL", limit=500)
-        image_url = escaped_js_field(chunk, "ImagePath", limit=500)
-        if not headline or not link or link in seen:
-            continue
-        if "dhakapost.com" not in urlparse(link).netloc:
-            continue
 
-        category = path_category_from_link(link)
-        if category.lower() in {"jobs career", "jobs"}:
+def dhaka_post_latest_action_id(html: str) -> Optional[str]:
+    urls = sorted(
+        set(
+            re.findall(
+                r'https://cdn\.dhakapost\.com/_next/static/[^"\\]+/latest-news/page-[^"\\]+?\.js\?dpl=[^"\\]+',
+                html,
+            )
+        )
+    )
+    for url in urls:
+        try:
+            script = fetch_html(url)
+        except requests.RequestException:
             continue
+        match = re.search(r'createServerReference\)\("([0-9a-f]+)".*?"getMoreLatest"', script)
+        if match:
+            return match.group(1)
+    return None
 
-        published = dhaka_post_time_from_image(image_url)
-        if not published or published < cutoff:
-            continue
 
-        cached = cached_article(link, article_cache)
-        if cached and cached.get("Publisher") == "Dhaka Post" and has_match_context(cached):
-            articles.append(cached)
+def dhaka_post_more_latest(action_id: str, limit: int, offset: int) -> List[Dict]:
+    response = polite_post(
+        "https://www.dhakapost.com/latest-news",
+        headers={
+            "Accept": "text/x-component",
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Next-Action": action_id,
+            "Origin": "https://www.dhakapost.com",
+            "Referer": "https://www.dhakapost.com/latest-news",
+        },
+        data=json.dumps([limit, offset]),
+    )
+    text = response.content.decode("utf-8", "replace")
+    match = re.search(r'1:(\{.*\})', text, re.DOTALL)
+    if not match:
+        return []
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    contents = data.get("contents") if isinstance(data, dict) else []
+    return contents if isinstance(contents, list) else []
+
+
+def scrape_dhaka_post(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
+    html = fetch_html("https://www.dhakapost.com/latest-news")
+    articles: List[Dict[str, str]] = []
+    seen = set()
+    page_size = 12
+    action_id = dhaka_post_latest_action_id(html)
+    offset = 0
+
+    while True:
+        if action_id:
+            rows = dhaka_post_more_latest(action_id, page_size, offset)
+        else:
+            rows = dhaka_post_rows_from_embedded_html(html) if offset == 0 else []
+        if not rows:
+            break
+
+        oldest_on_page: Optional[datetime] = None
+        for row in rows:
+            image_url = clean_text(
+                row.get("ImagePath")
+                or row.get("ImagePathSm")
+                or row.get("ImagePathMd")
+                or row.get("ImagePathXs")
+                or "",
+                limit=500,
+            )
+            row_published = dhaka_post_time_from_image(image_url)
+            if row_published:
+                oldest_on_page = row_published if oldest_on_page is None else min(oldest_on_page, row_published)
+
+            article = dhaka_post_article_from_row(row, cutoff)
+            if not article:
+                continue
+
+            link = article["Link"]
+            if link in seen:
+                continue
             seen.add(link)
-            continue
 
-        summary = escaped_js_field(chunk, "Brief")
-        article = {
-            "Headline": headline,
-            "Link": link,
-            "PublishedTime": published.isoformat(),
-            "Publisher": "Dhaka Post",
-            "Category": category,
-            "Summary": summary,
-            "BodySnippet": summary,
-        }
-        if article_cache is not None:
-            article_cache[link] = article
-        seen.add(link)
-        articles.append(article)
+            cached = cached_article(link, article_cache)
+            if cached and cached.get("Publisher") == "Dhaka Post" and has_match_context(cached):
+                articles.append(cached)
+                continue
+
+            if article_cache is not None:
+                article_cache[link] = article
+            articles.append(article)
+
+        if len(rows) < page_size or (oldest_on_page is not None and oldest_on_page < cutoff):
+            break
+        offset += page_size
 
     return articles
 
