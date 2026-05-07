@@ -1481,8 +1481,13 @@ PAGE = """
     .filter-segments {
       display: flex;
       gap: 8px;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       align-items: center;
+      max-width: 100%;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding-bottom: 2px;
+      scrollbar-width: thin;
     }
     .filter-dropdown {
       position: relative;
@@ -1562,6 +1567,7 @@ PAGE = """
       color: var(--accent-dark);
     }
     .filter-chip {
+      flex: 0 0 auto;
       height: 38px;
       border-radius: 999px;
       border: 1px solid var(--line);
@@ -2122,10 +2128,8 @@ PAGE = """
 
     function publisherLabel(name) {
       const labels = {
-        "The Daily Star": "Daily Star",
+        "The Daily Star": "TDS",
         "The Business Standard": "TBS",
-        "Prothom Alo": "Prothom",
-        "Bonik Barta": "Bonik",
         "bdnews24.com": "bdnews24"
       };
       return labels[name] || name;
@@ -2528,7 +2532,7 @@ PAGE = """
         <button type="button" class="filter-option ${name ? "" : "active"}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
       `).join("");
       const publisherChips = ["", ...pageConfig.publishers].map((name) => `
-        <button type="button" class="filter-chip ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name || "All publishers"}</button>
+        <button type="button" class="filter-chip ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name ? escapeHtml(publisherLabel(name)) : "All publishers"}</button>
       `).join("");
 
       content.innerHTML = `

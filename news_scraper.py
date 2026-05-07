@@ -29,6 +29,7 @@ SCRAPE_DELAY_MIN = float(os.getenv("SCRAPE_DELAY_MIN", "0.5"))
 SCRAPE_DELAY_MAX = float(os.getenv("SCRAPE_DELAY_MAX", "2.0"))
 SCRAPE_MAX_RETRIES = int(os.getenv("SCRAPE_MAX_RETRIES", "3"))
 DAILY_STAR_WORKERS = int(os.getenv("DAILY_STAR_WORKERS", "4"))
+SAMAKAL_WORKERS = int(os.getenv("SAMAKAL_WORKERS", "8"))
 HOST_LOCKS: Dict[str, threading.Lock] = {}
 HOST_LAST_REQUEST: Dict[str, float] = {}
 HOST_LOCKS_GUARD = threading.Lock()
@@ -659,7 +660,7 @@ def samakal_latest_candidates(page_url: str) -> Iterable[Tuple[str, str]]:
         yield link, headline
 
 
-def scrape_samakal(cutoff: datetime, max_pages: int = 4, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
+def scrape_samakal(cutoff: datetime, max_pages: int = 12, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
     articles: List[Dict[str, str]] = []
     seen = set()
 
@@ -670,6 +671,7 @@ def scrape_samakal(cutoff: datetime, max_pages: int = 4, article_cache: Optional
             break
 
         oldest_on_page: Optional[datetime] = None
+        uncached_candidates: Dict[str, str] = {}
         for link, headline in candidates:
             if link in seen:
                 continue
@@ -683,23 +685,31 @@ def scrape_samakal(cutoff: datetime, max_pages: int = 4, article_cache: Optional
                     articles.append(cached)
                 continue
 
-            article = extract_samakal_article(link, headline, cutoff)
-            if not article:
-                continue
-            if article_cache is not None:
-                article_cache[link] = article
+            uncached_candidates[link] = headline
 
-            published = datetime.fromisoformat(article["PublishedTime"]).astimezone(DHAKA)
-            oldest_on_page = published if oldest_on_page is None else min(oldest_on_page, published)
-            articles.append(article)
+        with ThreadPoolExecutor(max_workers=max(1, SAMAKAL_WORKERS)) as executor:
+            futures = {
+                executor.submit(extract_samakal_article, link, headline, cutoff): link
+                for link, headline in uncached_candidates.items()
+            }
+            for future in as_completed(futures):
+                article = future.result()
+                if not article:
+                    continue
+                if article_cache is not None:
+                    article_cache[futures[future]] = article
+
+                published = datetime.fromisoformat(article["PublishedTime"]).astimezone(DHAKA)
+                oldest_on_page = published if oldest_on_page is None else min(oldest_on_page, published)
+                articles.append(article)
 
         if oldest_on_page is not None and oldest_on_page < cutoff:
             break
 
     return articles
 
-
 BONIK_BARTA_FILTER_IDS = (52, 41)
+BONIK_BARTA_SEARCH_PAGE_SIZE = 20
 
 
 def bonik_barta_link(url_path: str) -> str:
@@ -713,29 +723,53 @@ def bonik_barta_link(url_path: str) -> str:
     return "https://www.bonikbarta.com/" + "/".join(parts)
 
 
-def scrape_bonik_barta(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
+def bonik_barta_article_from_post(post: Dict, cutoff: datetime) -> Optional[Dict[str, str]]:
+    published = parse_site_datetime(post.get("first_published_at", ""))
+    title = clean_text(post.get("title", ""), limit=300)
+    url_path = post.get("url_path", "")
+    if not published or not title or not url_path or published < cutoff:
+        return None
+
+    link = bonik_barta_link(url_path)
+    summary = clean_text(BeautifulSoup(post.get("summary") or "", "html.parser").get_text(" ", strip=True))
+    category = clean_text(
+        post.get("primary_category_title")
+        or post.get("primary_category_slug")
+        or path_category_from_link(link)
+    )
+    return {
+        "Headline": title,
+        "Link": link,
+        "PublishedTime": published.isoformat(),
+        "Publisher": "Bonik Barta",
+        "Category": category,
+        "Summary": summary,
+        "BodySnippet": summary,
+    }
+
+
+def scrape_bonik_barta(cutoff: datetime, max_pages: int = 25, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
     articles: List[Dict[str, str]] = []
     seen = set()
 
-    for filter_id in BONIK_BARTA_FILTER_IDS:
-        payload = fetch_json(f"https://www.bonikbarta.com/api/post-filters/{filter_id}")
+    for page in range(1, max_pages + 1):
+        url = "https://www.bonikbarta.com/api/search?query=" if page == 1 else f"https://www.bonikbarta.com/api/search?query=&page={page}"
+        payload = fetch_json(url)
         posts = payload.get("posts") or []
         if not posts:
-            continue
+            break
 
-        oldest_on_filter: Optional[datetime] = None
+        oldest_on_page: Optional[datetime] = None
         for post in posts:
             published = parse_site_datetime(post.get("first_published_at", ""))
-            title = clean_text(post.get("title", ""), limit=300)
-            url_path = post.get("url_path", "")
-            if not published or not title or not url_path:
+            if published:
+                oldest_on_page = published if oldest_on_page is None else min(oldest_on_page, published)
+
+            article = bonik_barta_article_from_post(post, cutoff)
+            if not article:
                 continue
 
-            oldest_on_filter = published if oldest_on_filter is None else min(oldest_on_filter, published)
-            if published < cutoff:
-                continue
-
-            link = bonik_barta_link(url_path)
+            link = article["Link"]
             if link in seen:
                 continue
             seen.add(link)
@@ -745,25 +779,11 @@ def scrape_bonik_barta(cutoff: datetime, article_cache: Optional[Dict[str, Dict[
                 articles.append(cached)
                 continue
 
-            summary = clean_text(BeautifulSoup(post.get("summary") or "", "html.parser").get_text(" ", strip=True))
-            article = {
-                "Headline": title,
-                "Link": link,
-                "PublishedTime": published.isoformat(),
-                "Publisher": "Bonik Barta",
-                "Category": clean_text(
-                    post.get("primary_category_title")
-                    or post.get("primary_category_slug")
-                    or (urlparse(link).path.split("/")[1] if len(urlparse(link).path.split("/")) > 1 else "")
-                ),
-                "Summary": summary,
-                "BodySnippet": summary,
-            }
             if article_cache is not None:
                 article_cache[link] = article
             articles.append(article)
 
-        if oldest_on_filter is not None and oldest_on_filter < cutoff:
+        if len(posts) < BONIK_BARTA_SEARCH_PAGE_SIZE or (oldest_on_page is not None and oldest_on_page < cutoff):
             break
 
     return articles
@@ -973,13 +993,29 @@ def json_ld_has_type(node: Dict, type_name: str) -> bool:
 
 
 BDNEWS_SKIP_SECTIONS = {"image", "media-en", "tube", "hello"}
+BDNEWS_SECTIONS = (
+    "",
+    "bangladesh",
+    "politics",
+    "economy",
+    "business",
+    "world",
+    "sport",
+    "cricket",
+    "health",
+    "campus",
+    "technology",
+    "environment",
+    "opinion",
+    "neighbours",
+)
 
 
-BDNEWS_WORKERS = int(os.getenv("BDNEWS_WORKERS", "4"))
+BDNEWS_WORKERS = int(os.getenv("BDNEWS_WORKERS", "8"))
 
 
-def bdnews_latest_candidates(max_links: int = 35) -> List[str]:
-    soup = BeautifulSoup(fetch_html("https://bdnews24.com/"), "html.parser")
+def bdnews_article_links_from_html(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
     links: List[str] = []
     seen = set()
     for anchor in soup.select("a[href]"):
@@ -997,8 +1033,26 @@ def bdnews_latest_candidates(max_links: int = 35) -> List[str]:
             continue
         seen.add(normalized)
         links.append(normalized)
-        if len(links) >= max_links:
-            break
+    return links
+
+
+def bdnews_latest_candidates(max_links: int = 180) -> List[str]:
+    links: List[str] = []
+    seen = set()
+    for section in BDNEWS_SECTIONS:
+        url = "https://bdnews24.com/" if not section else f"https://bdnews24.com/{section}"
+        try:
+            page_links = bdnews_article_links_from_html(fetch_html(url))
+        except requests.RequestException:
+            continue
+
+        for link in page_links:
+            if link in seen:
+                continue
+            seen.add(link)
+            links.append(link)
+            if len(links) >= max_links:
+                return links
     return links
 
 
