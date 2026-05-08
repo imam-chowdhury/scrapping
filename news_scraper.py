@@ -1014,10 +1014,23 @@ BDNEWS_SECTIONS = (
 BDNEWS_WORKERS = int(os.getenv("BDNEWS_WORKERS", "8"))
 
 
+def bdnews_story_id(link: str) -> str:
+    segments = [segment for segment in urlparse(link).path.split("/") if segment]
+    if segments and re.fullmatch(r"[0-9a-f]{8,}", segments[-1]):
+        return segments[-1]
+    return link
+
+
+def bdnews_link_score(link: str) -> Tuple[int, int]:
+    segments = [segment for segment in urlparse(link).path.split("/") if segment]
+    first = segments[0].lower() if segments else ""
+    # Prefer canonical section URLs like /world/asia-pacific/id over alias URLs like /asia-pacific/id.
+    return (1 if first in BDNEWS_SECTIONS else 0, len(segments))
+
+
 def bdnews_article_links_from_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
-    links: List[str] = []
-    seen = set()
+    links_by_story: Dict[str, str] = {}
     for anchor in soup.select("a[href]"):
         link = urljoin("https://bdnews24.com/", anchor.get("href", ""))
         parsed = urlparse(link)
@@ -1029,11 +1042,11 @@ def bdnews_article_links_from_html(html: str) -> List[str]:
         if not re.fullmatch(r"[0-9a-f]{8,}", segments[-1]):
             continue
         normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        links.append(normalized)
-    return links
+        story_id = bdnews_story_id(normalized)
+        existing = links_by_story.get(story_id)
+        if not existing or bdnews_link_score(normalized) > bdnews_link_score(existing):
+            links_by_story[story_id] = normalized
+    return list(links_by_story.values())
 
 
 def bdnews_latest_candidates(max_links: int = 180) -> List[str]:
@@ -1047,9 +1060,10 @@ def bdnews_latest_candidates(max_links: int = 180) -> List[str]:
             continue
 
         for link in page_links:
-            if link in seen:
+            story_id = bdnews_story_id(link)
+            if story_id in seen:
                 continue
-            seen.add(link)
+            seen.add(story_id)
             links.append(link)
             if len(links) >= max_links:
                 return links
