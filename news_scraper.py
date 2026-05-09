@@ -809,6 +809,42 @@ def escaped_js_field(chunk: str, field: str, limit: int = 1200) -> str:
     return clean_text(decode_embedded_js_value(match.group(1)), limit=limit)
 
 
+BENGALI_DIGIT_TRANSLATION = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+BANGLA_MONTHS = {
+    "জানুয়ারি": 1,
+    "জানুয়ারি": 1,
+    "ফেব্রুয়ারি": 2,
+    "ফেব্রুয়ারি": 2,
+    "মার্চ": 3,
+    "এপ্রিল": 4,
+    "মে": 5,
+    "জুন": 6,
+    "জুলাই": 7,
+    "আগস্ট": 8,
+    "সেপ্টেম্বর": 9,
+    "অক্টোবর": 10,
+    "নভেম্বর": 11,
+    "ডিসেম্বর": 12,
+}
+
+
+def dhaka_post_time_from_created_at(value: str) -> Optional[datetime]:
+    text = clean_text(value or "").translate(BENGALI_DIGIT_TRANSLATION)
+    match = re.search(r"(\d{1,2})\s+([^,\s]+)\s+(\d{4}),?\s+(\d{1,2}):(\d{2})", text)
+    if not match:
+        return None
+
+    day, month_name, year, hour, minute = match.groups()
+    month = BANGLA_MONTHS.get(month_name)
+    if not month:
+        return None
+
+    try:
+        return datetime(int(year), month, int(day), int(hour), int(minute), tzinfo=DHAKA)
+    except ValueError:
+        return None
+
+
 def dhaka_post_time_from_image(image_url: str) -> Optional[datetime]:
     match = re.search(r"(?<!\d)(20\d{12})(?!\d)", image_url or "")
     if not match:
@@ -819,17 +855,26 @@ def dhaka_post_time_from_image(image_url: str) -> Optional[datetime]:
         return None
 
 
+def dhaka_post_row_published(row: Dict) -> Optional[datetime]:
+    return (
+        dhaka_post_time_from_created_at(str(row.get("CreatedAtBangla") or ""))
+        or dhaka_post_time_from_created_at(str(row.get("created_at_bangla") or ""))
+        or dhaka_post_time_from_image(
+            clean_text(
+                row.get("ImagePath")
+                or row.get("ImagePathSm")
+                or row.get("ImagePathMd")
+                or row.get("ImagePathXs")
+                or "",
+                limit=500,
+            )
+        )
+    )
+
+
 def dhaka_post_article_from_row(row: Dict, cutoff: datetime) -> Optional[Dict[str, str]]:
     headline = clean_text(row.get("Heading") or row.get("headline") or "", limit=300)
     link = clean_text(row.get("URL") or row.get("url") or "", limit=500)
-    image_url = clean_text(
-        row.get("ImagePath")
-        or row.get("ImagePathSm")
-        or row.get("ImagePathMd")
-        or row.get("ImagePathXs")
-        or "",
-        limit=500,
-    )
     if not headline or not link or "dhakapost.com" not in urlparse(link).netloc:
         return None
 
@@ -837,7 +882,7 @@ def dhaka_post_article_from_row(row: Dict, cutoff: datetime) -> Optional[Dict[st
     if category.lower() in {"jobs career", "jobs"}:
         return None
 
-    published = dhaka_post_time_from_image(image_url)
+    published = dhaka_post_row_published(row)
     if not published or published < cutoff:
         return None
 
@@ -863,6 +908,7 @@ def dhaka_post_rows_from_embedded_html(html: str) -> List[Dict]:
             {
                 "Heading": escaped_js_field(chunk, "Heading", limit=300),
                 "URL": escaped_js_field(chunk, "URL", limit=500),
+                "CreatedAtBangla": escaped_js_field(chunk, "CreatedAtBangla", limit=120),
                 "ImagePath": (
                     escaped_js_field(chunk, "ImagePath", limit=500)
                     or escaped_js_field(chunk, "ImagePathSm", limit=500)
@@ -938,15 +984,7 @@ def scrape_dhaka_post(cutoff: datetime, article_cache: Optional[Dict[str, Dict[s
 
         oldest_on_page: Optional[datetime] = None
         for row in rows:
-            image_url = clean_text(
-                row.get("ImagePath")
-                or row.get("ImagePathSm")
-                or row.get("ImagePathMd")
-                or row.get("ImagePathXs")
-                or "",
-                limit=500,
-            )
-            row_published = dhaka_post_time_from_image(image_url)
+            row_published = dhaka_post_row_published(row)
             if row_published:
                 oldest_on_page = row_published if oldest_on_page is None else min(oldest_on_page, row_published)
 
