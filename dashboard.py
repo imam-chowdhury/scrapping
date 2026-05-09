@@ -1268,6 +1268,31 @@ PAGE = """
       text-transform: uppercase;
       color: var(--muted);
     }
+    .sort-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-weight: inherit;
+      text-transform: inherit;
+      letter-spacing: inherit;
+      cursor: pointer;
+    }
+    .sort-toggle::after {
+      font-size: 11px;
+      line-height: 1;
+      color: var(--accent-dark);
+    }
+    .sort-toggle[data-direction="desc"]::after {
+      content: "↓";
+    }
+    .sort-toggle[data-direction="asc"]::after {
+      content: "↑";
+    }
     tr:last-child td { border-bottom: 0; }
     #compareResults table {
       min-width: 0;
@@ -1679,7 +1704,7 @@ PAGE = """
     .live-feed-head,
     .live-feed-row {
       display: grid;
-      grid-template-columns: 86px 128px 128px minmax(0, 1fr) 146px;
+      grid-template-columns: 128px 92px 72px 128px minmax(0, 1fr) 146px;
       gap: 12px;
       align-items: start;
       padding: 12px;
@@ -1691,6 +1716,9 @@ PAGE = """
       font-weight: 800;
       text-transform: uppercase;
       letter-spacing: .02em;
+    }
+    .live-feed-head .sort-toggle {
+      justify-self: start;
     }
     .live-feed-row {
       border-top: 1px solid rgba(102,112,133,0.12);
@@ -1989,8 +2017,8 @@ PAGE = """
         </div>
       </div>
       <nav>
-        <a class="nav-link {% if view_mode == 'compare' %}active{% endif %}" href="/">Compare</a>
-        <a class="nav-link {% if view_mode == 'live' %}active{% endif %}" href="/live">Live 1h</a>
+        <a class="nav-link {% if view_mode == 'live' %}active{% endif %}" href="/">Live 1h</a>
+        <a class="nav-link {% if view_mode == 'compare' %}active{% endif %}" href="/compare">Live 5h</a>
         <a class="nav-link {% if view_mode == 'analysis' %}active{% endif %}" href="/analysis">Analysis</a>
       </nav>
     </div>
@@ -2114,9 +2142,10 @@ PAGE = """
       `;
     }
 
-    function sortByTime(rows) {
+    function sortByTime(rows, direction = "desc") {
       return [...rows].sort((left, right) => {
-        return new Date(right.PublishedTime) - new Date(left.PublishedTime);
+        const delta = new Date(right.PublishedTime) - new Date(left.PublishedTime);
+        return direction === "asc" ? -delta : delta;
       });
     }
 
@@ -2286,14 +2315,23 @@ PAGE = """
         .filter(([name]) => name !== baseline)
         .reduce((sum, [, count]) => sum + count, 0);
       const topCategory = (data.top_categories || [])[0];
+      const showHourlyNotes = pageConfig.viewMode === "analysis";
       const cards = [
-        { value: data.count || 0, label: `Last ${data.window_hours}h total`, note: `${liveTotal} in the last 1h` },
-        { value: counts[baseline] || 0, label: baseline, note: `${liveCounts[baseline] || 0} in the last 1h` },
+        {
+          value: data.count || 0,
+          label: `Last ${data.window_hours}h total`,
+          note: showHourlyNotes ? `${liveTotal} in the last 1h` : ""
+        },
+        {
+          value: counts[baseline] || 0,
+          label: baseline,
+          note: showHourlyNotes ? `${liveCounts[baseline] || 0} in the last 1h` : ""
+        },
         { value: competitorTotal, label: "Competitors", note: `${pageConfig.competitors.length} tracked publishers` },
         ...pageConfig.competitors.map((name) => ({
           value: counts[name] || 0,
           label: publisherLabel(name),
-          note: `${liveCounts[name] || 0} in the last 1h`
+          note: showHourlyNotes ? `${liveCounts[name] || 0} in the last 1h` : ""
         })),
         { value: topCategory ? topCategory.count : 0, label: "Hot beat", note: topCategory ? topCategory.name : "No category yet" }
       ];
@@ -2302,7 +2340,7 @@ PAGE = """
         <article class="summary-card">
           <strong>${card.value}</strong>
           <span>${card.label}</span>
-          <em>${card.note}</em>
+          ${card.note ? `<em>${card.note}</em>` : ""}
         </article>
       `).join("");
     }
@@ -2372,19 +2410,20 @@ PAGE = """
       const beats = beatOptions(data.articles || []);
       let selectedBeat = "";
       let selectedPublisher = "";
+      let sortDirection = "desc";
       const beatOptionsHtml = ["", ...beats].map((name) => `
         <button type="button" class="filter-option ${name ? "" : "active"}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
       `).join("");
-      const publisherOptionsHtml = ["", ...pageConfig.publishers].map((name) => `
-        <button type="button" class="filter-option ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name || "All publishers"}</button>
+      const publisherChips = ["", ...pageConfig.publishers].map((name) => `
+        <button type="button" class="filter-chip ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name ? escapeHtml(publisherLabel(name)) : "All publishers"}</button>
       `).join("");
       content.innerHTML = `
         <section class="page-grid">
           <section class="panel">
             <div class="panel-header">
               <div>
-                <h2>Publisher compare</h2>
-                <p>All-publication timeline sorted newest to oldest so reporters can spot the latest move first.</p>
+                <h2>Live 5h</h2>
+                <p>Five-hour all-publication timeline sorted newest to oldest so reporters can spot the latest move first.</p>
               </div>
             </div>
             <div class="toolbar">
@@ -2395,12 +2434,7 @@ PAGE = """
                 </button>
                 <div class="filter-menu" role="listbox">${beatOptionsHtml}</div>
               </div>
-              <div class="filter-dropdown" id="comparePublisher">
-                <button type="button" class="filter-dropdown-button" aria-haspopup="listbox" aria-expanded="false">
-                  <span>All publishers</span>
-                </button>
-                <div class="filter-menu" role="listbox">${publisherOptionsHtml}</div>
-              </div>
+              <div class="filter-segments" id="comparePublisher">${publisherChips}</div>
             </div>
             <div class="publisher-stack" id="compareResults"></div>
           </section>
@@ -2426,8 +2460,6 @@ PAGE = """
       const beatButton = beat.querySelector(".filter-dropdown-button");
       const beatLabel = beatButton.querySelector("span");
       const publisher = document.getElementById("comparePublisher");
-      const publisherButton = publisher.querySelector(".filter-dropdown-button");
-      const publisherLabel = publisherButton.querySelector("span");
       const compareResults = document.getElementById("compareResults");
 
       function paintCompare() {
@@ -2438,9 +2470,10 @@ PAGE = """
           return (!selectedBeat || beatName === selectedBeat) &&
             (!selectedPublisher || article.Publisher === selectedPublisher) &&
             (!term || text.includes(term));
-        }).sort((left, right) => new Date(right.PublishedTime) - new Date(left.PublishedTime));
+        });
+        const sorted = sortByTime(filtered, sortDirection);
 
-        if (!filtered.length) {
+        if (!sorted.length) {
           compareResults.innerHTML = '<div class="empty">No matching articles in this view.</div>';
           return;
         }
@@ -2449,23 +2482,27 @@ PAGE = """
           <section class="publisher-section">
             <div class="publisher-heading">
               <h3>All publications</h3>
-              <div class="meta">${filtered.length} articles, newest first</div>
+              <div class="meta">${sorted.length} articles, ${sortDirection === "desc" ? "newest first" : "oldest first"}</div>
             </div>
             <table>
               <thead>
                 <tr>
                   <th>Publisher</th>
                   <th>Published</th>
-                  <th>Age</th>
+                  <th><button type="button" class="sort-toggle" data-sort-age data-direction="${sortDirection}" aria-label="Sort age ${sortDirection === "desc" ? "oldest first" : "newest first"}">Age</button></th>
                   <th>Category</th>
                   <th>Headline</th>
                   <th>Action</th>
                 </tr>
               </thead>
-              <tbody>${compareTableRows(filtered)}</tbody>
+              <tbody>${compareTableRows(sorted)}</tbody>
             </table>
           </section>
         `;
+        compareResults.querySelector("[data-sort-age]")?.addEventListener("click", () => {
+          sortDirection = sortDirection === "desc" ? "asc" : "desc";
+          paintCompare();
+        });
         bindActionControls(compareResults);
       }
 
@@ -2476,10 +2513,6 @@ PAGE = """
           picker.classList.remove("open");
           picker.querySelector(".action-status-button")?.setAttribute("aria-expanded", "false");
         });
-        if (publisher.classList.contains("open")) {
-          publisher.classList.remove("open");
-          publisherButton.setAttribute("aria-expanded", "false");
-        }
         const open = !beat.classList.contains("open");
         beat.classList.toggle("open", open);
         beatButton.setAttribute("aria-expanded", open ? "true" : "false");
@@ -2495,28 +2528,14 @@ PAGE = """
           paintCompare();
         });
       });
-      publisherButton.addEventListener("click", (event) => {
-        event.stopPropagation();
-        document.querySelectorAll(".action-status-picker.open").forEach((picker) => {
-          picker.classList.remove("open");
-          picker.querySelector(".action-status-button")?.setAttribute("aria-expanded", "false");
-        });
-        if (beat.classList.contains("open")) {
-          beat.classList.remove("open");
-          beatButton.setAttribute("aria-expanded", "false");
-        }
-        const open = !publisher.classList.contains("open");
-        publisher.classList.toggle("open", open);
-        publisherButton.setAttribute("aria-expanded", open ? "true" : "false");
-      });
-      publisher.querySelectorAll(".filter-option").forEach((option) => {
-        option.addEventListener("click", (event) => {
-          event.stopPropagation();
-          selectedPublisher = option.dataset.publisher || "";
-          publisherLabel.textContent = selectedPublisher || "All publishers";
-          publisher.querySelectorAll(".filter-option").forEach((item) => item.classList.toggle("active", item === option));
-          publisher.classList.remove("open");
-          publisherButton.setAttribute("aria-expanded", "false");
+      publisher.querySelectorAll(".filter-chip").forEach((chip) => {
+        chip.addEventListener("click", () => {
+          selectedPublisher = chip.dataset.publisher || "";
+          if (beat.classList.contains("open")) {
+            beat.classList.remove("open");
+            beatButton.setAttribute("aria-expanded", "false");
+          }
+          publisher.querySelectorAll(".filter-chip").forEach((item) => item.classList.toggle("active", item === chip));
           paintCompare();
         });
       });
@@ -2528,6 +2547,7 @@ PAGE = """
       const beats = beatOptions(data.articles || []);
       let selectedBeat = "";
       let selectedPublisher = "";
+      let sortDirection = "desc";
       const beatOptionsHtml = ["", ...beats].map((name) => `
         <button type="button" class="filter-option ${name ? "" : "active"}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
       `).join("");
@@ -2579,43 +2599,18 @@ PAGE = """
             <div class="publisher-stack" id="liveResults"></div>
           </section>
           <section class="stack">
-            <section class="panel">
-              <div class="panel-header">
-                <div>
-                  <h3>Hot beats</h3>
-                  <p>Where the last hour is concentrating.</p>
-                </div>
-              </div>
-              <div class="analysis-block">
-                <div class="analysis-list">
-                  ${(data.top_categories || []).slice(0, 6).map((item) => `
-                    <div class="analysis-row">
-                      <strong>${item.name}</strong>
-                      <span>${item.count} articles</span>
-                    </div>
-                  `).join("")}
-                </div>
-              </div>
-            </section>
-            <section class="panel">
-              <div class="panel-header">
-                <div>
-                  <h3>Publisher pace</h3>
-                  <p>Who is moving fastest in the last hour.</p>
-                </div>
-              </div>
-              <div class="analysis-block">
-                <div class="analysis-list">
-                  ${pageConfig.publishers.map((name) => `
-                    <div class="analysis-row">
-                      <strong>${name}</strong>
-                      <span>${(data.publisher_counts || {})[name] || 0} articles</span>
-                    </div>
-                  `).join("")}
-                </div>
-              </div>
-            </section>
             ${renderSignalCard(data.live_signal || [])}
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Beat performance</h3>
+                  <p>Same beats merged across Bangla and English labels.</p>
+                </div>
+              </div>
+              <div class="analysis-block">
+                ${renderBeatPerformance(data.shared_categories || [], 8)}
+              </div>
+            </section>
           </section>
         </section>
       `;
@@ -2630,8 +2625,9 @@ PAGE = """
       function liveRows(rows) {
         return rows.map((article) => `
           <article class="live-feed-row">
-            <div data-label="Published">${formatTime(article.PublishedTime)}<br><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></div>
             <div data-label="Publisher">${publisherPill(article.Publisher)}</div>
+            <div data-label="Published">${formatTime(article.PublishedTime)}</div>
+            <div data-label="Age"><span class="${ageClass(article.PublishedTime)}">${ageText(article.PublishedTime)}</span></div>
             <div data-label="Beat"><span class="category-chip">${article.CanonicalCategory || article.Category || "Uncategorized"}</span></div>
             <div data-label="Headline" class="headline-cell">
               <a class="${publisherHeadlineClass(article.Publisher)}" href="${article.Link}" target="_blank" rel="noreferrer">${article.Headline}</a>
@@ -2649,13 +2645,14 @@ PAGE = """
           return (!selectedBeat || beatName === selectedBeat) &&
             (!selectedPublisher || article.Publisher === selectedPublisher) &&
             (!term || text.includes(term));
-        }));
+        }), sortDirection);
 
         liveResults.innerHTML = rows.length ? `
           <div class="live-feed">
             <div class="live-feed-head">
-              <span>Published</span>
               <span>Publisher</span>
+              <span>Published</span>
+              <button type="button" class="sort-toggle" data-sort-age data-direction="${sortDirection}" aria-label="Sort age ${sortDirection === "desc" ? "oldest first" : "newest first"}">Age</button>
               <span>Beat</span>
               <span>Headline</span>
               <span>Action</span>
@@ -2663,6 +2660,10 @@ PAGE = """
             ${liveRows(rows)}
           </div>
         ` : '<div class="empty">No live items match these filters.</div>';
+        liveResults.querySelector("[data-sort-age]")?.addEventListener("click", () => {
+          sortDirection = sortDirection === "desc" ? "asc" : "desc";
+          paintLive();
+        });
         bindActionControls(liveResults);
       }
 
@@ -2749,73 +2750,28 @@ PAGE = """
 
       content.innerHTML = `
         <section class="stack">
-          <section class="panel">
-            <div class="panel-header">
-              <div>
-                <h2>Coverage gap analysis</h2>
-                <p>${pageConfig.baselinePublisher} is the baseline. Competitor stories are matched against its recent output.</p>
-              </div>
-            </div>
-            <div class="analysis-block">
-              <div class="note">${comparisonMessage}</div>
-              <div class="analysis-list">
-                <div class="analysis-row">
-                  <strong>Potential gaps</strong>
-                  <span>${(data.comparison_summary || {}).potential_gap || 0}</span>
-                </div>
-                <div class="analysis-row">
-                  <strong>Needs review</strong>
-                  <span>${(data.comparison_summary || {}).needs_review || 0}</span>
-                </div>
-                <div class="analysis-row">
-                  <strong>Covered competitor stories</strong>
-                  <span>${(data.comparison_summary || {}).covered || 0}</span>
-                </div>
-                <div class="analysis-row">
-                  <strong>Total competitor stories scored</strong>
-                  <span>${(data.comparison_summary || {}).competitor_total || 0}</span>
-                </div>
-              </div>
-            </div>
-            ${renderCoverageRows(gapRows)}
-          </section>
-
           <section class="analysis-grid">
-            <section class="panel analysis-block">
-              <div class="panel-header">
-                <div>
-                  <h3>Missed by source</h3>
-                  <p>How often each competitor produced a non-covered story.</p>
-                </div>
-              </div>
-              <div class="analysis-list">
-                ${(data.missed_by_source || []).map((item) => `
-                  <div class="analysis-row">
-                    <strong>${item.publisher}</strong>
-                    <span>${item.count} flagged stories</span>
+            <section class="stack">
+              ${renderSignalCard(data.live_signal || [])}
+              <section class="panel analysis-block">
+                <div class="panel-header">
+                  <div>
+                    <h3>Shared categories</h3>
+                    <p>Where the whole market is clustering coverage.</p>
                   </div>
-                `).join("") || '<div class="empty">No missed-by-source data yet.</div>'}
-              </div>
-            </section>
-
-            <section class="panel analysis-block">
-              <div class="panel-header">
-                <div>
-                  <h3>Category pressure</h3>
-                  <p>Topics where competitors are publishing more than the baseline.</p>
                 </div>
-              </div>
-              <div class="analysis-list">
-                ${(data.category_pressure || []).map((item) => `
-                  <div class="analysis-row">
-                    <div>
-                      <strong>${item.category}</strong>
-                      <span>Competitors ${item.competitor_count}, ${pageConfig.baselinePublisher} ${item.baseline_count}</span>
+                <div class="analysis-list">
+                  ${(data.shared_categories || []).map((item) => `
+                    <div class="analysis-row">
+                      <div>
+                        <strong>${item.category}</strong>
+                        <span>${item.total} total</span>
+                      </div>
+                      ${publisherCountGrid(item.publishers || {})}
                     </div>
-                    <span>+${item.delta}</span>
-                  </div>
-                `).join("") || '<div class="empty">No category pressure detected.</div>'}
-              </div>
+                  `).join("")}
+                </div>
+              </section>
             </section>
 
             <section class="panel analysis-block">
@@ -2836,16 +2792,6 @@ PAGE = """
                   </div>
                 `).join("")}
               </div>
-            </section>
-
-            <section class="panel analysis-block">
-              <div class="panel-header">
-                <div>
-                  <h3>Source architecture</h3>
-                  <p>Future source additions should not need a new dashboard model.</p>
-                </div>
-              </div>
-              <div class="note">${data.architecture_note}</div>
             </section>
           </section>
 
@@ -2878,27 +2824,86 @@ PAGE = """
                 </table>
               ` : '<div class="empty">No hourly data yet.</div>'}
             </section>
+          </section>
+
+          <section class="analysis-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2>Coverage gap analysis</h2>
+                  <p>${pageConfig.baselinePublisher} is the baseline. Competitor stories are matched against its recent output.</p>
+                </div>
+              </div>
+              <div class="analysis-block">
+                <div class="note">${comparisonMessage}</div>
+                <div class="analysis-list">
+                  <div class="analysis-row">
+                    <strong>Potential gaps</strong>
+                    <span>${(data.comparison_summary || {}).potential_gap || 0}</span>
+                  </div>
+                  <div class="analysis-row">
+                    <strong>Needs review</strong>
+                    <span>${(data.comparison_summary || {}).needs_review || 0}</span>
+                  </div>
+                  <div class="analysis-row">
+                    <strong>Covered competitor stories</strong>
+                    <span>${(data.comparison_summary || {}).covered || 0}</span>
+                  </div>
+                  <div class="analysis-row">
+                    <strong>Total competitor stories scored</strong>
+                    <span>${(data.comparison_summary || {}).competitor_total || 0}</span>
+                  </div>
+                </div>
+              </div>
+              ${renderCoverageRows(gapRows)}
+            </section>
 
             <section class="stack">
-              ${renderSignalCard(data.live_signal || [])}
               <section class="panel analysis-block">
                 <div class="panel-header">
                   <div>
-                    <h3>Shared categories</h3>
-                    <p>Where the whole market is clustering coverage.</p>
+                    <h3>Missed by source</h3>
+                    <p>How often each competitor produced a non-covered story.</p>
                   </div>
                 </div>
                 <div class="analysis-list">
-                  ${(data.shared_categories || []).map((item) => `
+                  ${(data.missed_by_source || []).map((item) => `
+                    <div class="analysis-row">
+                      <strong>${item.publisher}</strong>
+                      <span>${item.count} flagged stories</span>
+                    </div>
+                  `).join("") || '<div class="empty">No missed-by-source data yet.</div>'}
+                </div>
+              </section>
+
+              <section class="panel analysis-block">
+                <div class="panel-header">
+                  <div>
+                    <h3>Category pressure</h3>
+                    <p>Topics where competitors are publishing more than the baseline.</p>
+                  </div>
+                </div>
+                <div class="analysis-list">
+                  ${(data.category_pressure || []).map((item) => `
                     <div class="analysis-row">
                       <div>
                         <strong>${item.category}</strong>
-                        <span>${item.total} total</span>
+                        <span>Competitors ${item.competitor_count}, ${pageConfig.baselinePublisher} ${item.baseline_count}</span>
                       </div>
-                      ${publisherCountGrid(item.publishers || {})}
+                      <span>+${item.delta}</span>
                     </div>
-                  `).join("")}
+                  `).join("") || '<div class="empty">No category pressure detected.</div>'}
                 </div>
+              </section>
+
+              <section class="panel analysis-block">
+                <div class="panel-header">
+                  <div>
+                    <h3>Source architecture</h3>
+                    <p>Future source additions should not need a new dashboard model.</p>
+                  </div>
+                </div>
+                <div class="note">${data.architecture_note}</div>
               </section>
             </section>
           </section>
@@ -2966,9 +2971,19 @@ def render_page(view_mode: str, title: str, subtitle: str, hours: float):
 @app.get("/")
 def index():
     return render_page(
+        "live",
+        "News Monitoring Dashboard",
+        "One-hour mixed feed for immediate detection of what the market is pushing right now.",
+        LIVE_HOURS,
+    )
+
+
+@app.get("/compare")
+def compare():
+    return render_page(
         "compare",
-        "Reporter News Dashboard",
-        "Five-hour all-publication timeline across every tracked publisher, with the newest story first.",
+        "News Monitoring Dashboard",
+        "Live 5h mixed timeline across every tracked publisher, with the newest story first.",
         WINDOW_HOURS,
     )
 
@@ -2977,7 +2992,7 @@ def index():
 def live():
     return render_page(
         "live",
-        "Reporter Live Wire",
+        "News Monitoring Dashboard",
         "One-hour mixed feed for immediate detection of what the market is pushing right now.",
         LIVE_HOURS,
     )
