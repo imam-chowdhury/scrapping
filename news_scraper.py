@@ -68,22 +68,23 @@ def wait_for_host(url: str) -> None:
         HOST_LAST_REQUEST[host] = time.monotonic()
 
 
-def polite_get(url: str) -> requests.Response:
+def polite_get(url: str, *, timeout: int = 30, max_retries: Optional[int] = None) -> requests.Response:
     last_error = None
-    for attempt in range(SCRAPE_MAX_RETRIES):
+    retries = SCRAPE_MAX_RETRIES if max_retries is None else max(1, max_retries)
+    for attempt in range(retries):
         wait_for_host(url)
         try:
-            response = requests.get(url, headers=HEADERS, timeout=30)
+            response = requests.get(url, headers=HEADERS, timeout=timeout)
             if response.status_code in (403, 429):
                 raise ScrapeBlockedError(f"{response.status_code} from {url}")
-            if response.status_code >= 500 and attempt < SCRAPE_MAX_RETRIES - 1:
+            if response.status_code >= 500 and attempt < retries - 1:
                 time.sleep(min(30, 2 ** attempt + random.uniform(0, 1)))
                 continue
             response.raise_for_status()
             return response
         except (requests.RequestException, ScrapeBlockedError) as exc:
             last_error = exc
-            if isinstance(exc, ScrapeBlockedError) or attempt == SCRAPE_MAX_RETRIES - 1:
+            if isinstance(exc, ScrapeBlockedError) or attempt == retries - 1:
                 raise
             time.sleep(min(30, 2 ** attempt + random.uniform(0, 1)))
     raise last_error or RuntimeError(f"Failed to fetch {url}")
@@ -111,12 +112,12 @@ def polite_post(url: str, *, headers: Optional[Dict[str, str]] = None, data: str
     raise last_error or RuntimeError(f"Failed to post {url}")
 
 
-def fetch_json(url: str) -> Dict:
-    return polite_get(url).json()
+def fetch_json(url: str, *, timeout: int = 30, max_retries: Optional[int] = None) -> Dict:
+    return polite_get(url, timeout=timeout, max_retries=max_retries).json()
 
 
-def fetch_html(url: str) -> str:
-    return polite_get(url).text
+def fetch_html(url: str, *, timeout: int = 30, max_retries: Optional[int] = None) -> str:
+    return polite_get(url, timeout=timeout, max_retries=max_retries).text
 
 
 def normalize_category(value: str) -> str:
@@ -1069,6 +1070,9 @@ BDNEWS_SECTIONS = (
 
 
 BDNEWS_WORKERS = int(os.getenv("BDNEWS_WORKERS", "8"))
+BDNEWS_TIMEOUT = int(os.getenv("BDNEWS_TIMEOUT", "8"))
+BDNEWS_MAX_SECTION_FAILURES = int(os.getenv("BDNEWS_MAX_SECTION_FAILURES", "3"))
+BDNEWS_MAX_LINKS = int(os.getenv("BDNEWS_MAX_LINKS", "30"))
 
 
 def bdnews_story_id(link: str) -> str:
@@ -1109,12 +1113,17 @@ def bdnews_article_links_from_html(html: str) -> List[str]:
 def bdnews_latest_candidates(max_links: int = 180) -> List[str]:
     links: List[str] = []
     seen = set()
+    failures = 0
     for section in BDNEWS_SECTIONS:
         url = "https://bdnews24.com/" if not section else f"https://bdnews24.com/{section}"
         try:
-            page_links = bdnews_article_links_from_html(fetch_html(url))
-        except requests.RequestException:
+            page_links = bdnews_article_links_from_html(fetch_html(url, timeout=BDNEWS_TIMEOUT, max_retries=1))
+        except (requests.RequestException, ScrapeBlockedError):
+            failures += 1
+            if failures >= BDNEWS_MAX_SECTION_FAILURES and not links:
+                break
             continue
+        failures = 0
 
         for link in page_links:
             story_id = bdnews_story_id(link)
@@ -1129,8 +1138,8 @@ def bdnews_latest_candidates(max_links: int = 180) -> List[str]:
 
 def extract_bdnews24_article(link: str, cutoff: datetime) -> Optional[Dict[str, str]]:
     try:
-        soup = BeautifulSoup(fetch_html(link), "html.parser")
-    except requests.RequestException:
+        soup = BeautifulSoup(fetch_html(link, timeout=BDNEWS_TIMEOUT, max_retries=1), "html.parser")
+    except (requests.RequestException, ScrapeBlockedError):
         return None
 
     headline = ""
@@ -1176,7 +1185,7 @@ def extract_bdnews24_article(link: str, cutoff: datetime) -> Optional[Dict[str, 
 def scrape_bdnews24(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
     articles: List[Dict[str, str]] = []
     uncached_links: List[str] = []
-    for link in bdnews_latest_candidates():
+    for link in bdnews_latest_candidates(max_links=BDNEWS_MAX_LINKS):
         cached = cached_article(link, article_cache)
         if cached and cached.get("Publisher") == "bdnews24.com":
             try:
@@ -1236,7 +1245,14 @@ def scrape_sources(
         if not callable(scraper):
             continue
 
-        for article in scraper(cutoff, article_cache=article_cache):
+        try:
+            source_articles = scraper(cutoff, article_cache=article_cache)
+        except Exception as exc:
+            publisher = source.get("publisher", source_id)
+            print(f"Scrape warning: {publisher}: {exc}", file=sys.stderr)
+            continue
+
+        for article in source_articles:
             link = article.get("Link")
             if not link or link in seen:
                 continue
