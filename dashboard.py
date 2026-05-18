@@ -2935,6 +2935,15 @@ PAGE = """
       } else {
         renderCompareView(feedData);
       }
+
+      // When a long scrape is running, poll more frequently so the UI doesn't look stuck.
+      if (feedData && feedData.refreshing) {
+        clearTimeout(window.__refreshPoll);
+        window.__refreshPoll = setTimeout(loadData, 5000);
+      } else {
+        clearTimeout(window.__refreshPoll);
+        window.__refreshPoll = null;
+      }
     }
 
     async function refreshNow() {

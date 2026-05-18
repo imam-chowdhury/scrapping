@@ -29,6 +29,7 @@ SCRAPE_DELAY_MIN = float(os.getenv("SCRAPE_DELAY_MIN", "0.5"))
 SCRAPE_DELAY_MAX = float(os.getenv("SCRAPE_DELAY_MAX", "2.0"))
 SCRAPE_MAX_RETRIES = int(os.getenv("SCRAPE_MAX_RETRIES", "3"))
 DAILY_STAR_WORKERS = int(os.getenv("DAILY_STAR_WORKERS", "4"))
+DAILY_STAR_DETAIL_LIMIT = int(os.getenv("DAILY_STAR_DETAIL_LIMIT", "25"))
 SAMAKAL_WORKERS = int(os.getenv("SAMAKAL_WORKERS", "8"))
 HOST_LOCKS: Dict[str, threading.Lock] = {}
 HOST_LAST_REQUEST: Dict[str, float] = {}
@@ -416,15 +417,33 @@ def scrape_daily_star(cutoff: datetime, article_cache: Optional[Dict[str, Dict[s
         else:
             uncached_candidates[link] = (headline, published)
 
-    with ThreadPoolExecutor(max_workers=max(1, DAILY_STAR_WORKERS)) as executor:
-        futures = {
-            executor.submit(extract_daily_star_article, link, headline, published, cutoff): link
-            for link, (headline, published) in uncached_candidates.items()
+    # Fast path: build listing-level articles so the dashboard refresh can complete quickly.
+    # We then fetch full article pages for only the most recent candidates.
+    listing_articles: Dict[str, Dict[str, str]] = {}
+    for link, (headline, published) in uncached_candidates.items():
+        listing_articles[link] = {
+            "Headline": headline,
+            "Link": link,
+            "PublishedTime": published.isoformat(),
+            "Publisher": "The Daily Star",
+            "Category": daily_star_category_from_link(link),
+            "Summary": "",
+            "BodySnippet": "",
         }
-        for future in as_completed(futures):
-            article = future.result()
-            if article:
-                articles.append(article)
+    articles.extend(list(listing_articles.values()))
+
+    detail_limit = max(0, DAILY_STAR_DETAIL_LIMIT)
+    if detail_limit and uncached_candidates:
+        to_fetch = sorted(uncached_candidates.items(), key=lambda item: item[1][1], reverse=True)[:detail_limit]
+        with ThreadPoolExecutor(max_workers=max(1, DAILY_STAR_WORKERS)) as executor:
+            futures = {
+                executor.submit(extract_daily_star_article, link, headline, published, cutoff): link
+                for link, (headline, published) in to_fetch
+            }
+            for future in as_completed(futures):
+                article = future.result()
+                if article:
+                    listing_articles[article["Link"]] = article
 
     articles.sort(key=lambda item: item["PublishedTime"], reverse=True)
     return articles
