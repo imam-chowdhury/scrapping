@@ -1055,6 +1055,42 @@ PAGE = """
     }
     a { color: var(--accent-dark); text-decoration: none; }
     a:hover { text-decoration: underline; }
+    body.news-focus {
+      background: var(--panel);
+    }
+    body.news-focus header,
+    body.news-focus #summaryGrid,
+    body.news-focus #status {
+      display: none;
+    }
+    body.news-focus main {
+      width: 100%;
+      margin: 0;
+      padding: 0;
+    }
+    body.news-focus .page-grid,
+    body.news-focus .panel {
+      border-radius: 0;
+      border: 0;
+      box-shadow: none;
+    }
+    body.news-focus .panel-header {
+      position: sticky;
+      top: 0;
+      z-index: 4;
+      background: var(--panel);
+      border-bottom: 1px solid rgba(102,112,133,0.12);
+      padding-bottom: 14px;
+    }
+    body.news-focus .toolbar {
+      position: sticky;
+      top: 72px;
+      z-index: 3;
+      background: var(--panel);
+    }
+    body.news-focus .publisher-stack {
+      padding-bottom: 32px;
+    }
     header {
       position: sticky;
       top: 0;
@@ -1128,9 +1164,18 @@ PAGE = """
     }
     main { margin: 24px auto 48px; }
     .summary-grid {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      scrollbar-width: thin;
+    }
+    .summary-grid.analysis-summary {
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 14px;
+      overflow: visible;
+      padding-bottom: 0;
     }
     .summary-card, .panel {
       background: var(--panel);
@@ -1139,17 +1184,38 @@ PAGE = """
       box-shadow: var(--shadow);
       min-width: 0;
     }
-    .summary-card { padding: 16px; }
+    .summary-card {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 8px 12px;
+    }
+    .analysis-summary .summary-card {
+      display: block;
+      min-height: 0;
+      padding: 16px;
+    }
     .summary-card strong {
       display: block;
-      font-size: 30px;
+      font-size: 19px;
       line-height: 1;
+      margin-bottom: 0;
+    }
+    .analysis-summary .summary-card strong {
+      font-size: 30px;
       margin-bottom: 8px;
     }
     .summary-card span {
       display: block;
       color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .analysis-summary .summary-card span {
       font-size: 13px;
+      white-space: normal;
     }
     .summary-card em {
       display: block;
@@ -1182,6 +1248,9 @@ PAGE = """
     .live-layout {
       grid-template-columns: minmax(780px, 1fr) minmax(300px, 360px);
     }
+    .feed-only {
+      grid-template-columns: minmax(0, 1fr);
+    }
     .stack { display: grid; gap: 16px; }
     .page-grid > *,
     .command-grid > *,
@@ -1195,6 +1264,24 @@ PAGE = """
       align-items: flex-start;
       gap: 14px;
       padding: 18px 18px 0;
+    }
+    .panel-tools {
+      display: flex;
+      flex: 0 0 auto;
+      gap: 8px;
+    }
+    .focus-toggle {
+      height: 34px;
+      border-color: var(--line);
+      background: var(--panel);
+      color: var(--text);
+      padding: 0 12px;
+      white-space: nowrap;
+    }
+    .focus-toggle.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: white;
     }
     .panel-header h2, .panel-header h3 {
       margin: 0;
@@ -1890,7 +1977,7 @@ PAGE = """
     }
     @media (max-width: 900px) {
       .header-row { flex-direction: column; }
-      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .summary-grid.analysis-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .toolbar {
         display: grid;
         grid-template-columns: 1fr;
@@ -2032,6 +2119,10 @@ PAGE = """
     const pageConfig = {{ page_config | tojson }};
     let feedData = null;
     let analysisData = null;
+    const feedViewState = {
+      live: { selectedBeat: "", selectedPublisher: "", sortDirection: "desc", searchTerm: "" },
+      compare: { selectedBeat: "", selectedPublisher: "", sortDirection: "desc", searchTerm: "" }
+    };
     const statusBox = document.getElementById("status");
     const summaryGrid = document.getElementById("summaryGrid");
     const content = document.getElementById("content");
@@ -2316,7 +2407,14 @@ PAGE = """
         .reduce((sum, [, count]) => sum + count, 0);
       const topCategory = (data.top_categories || [])[0];
       const showHourlyNotes = pageConfig.viewMode === "analysis";
-      const cards = [
+      summaryGrid.classList.toggle("analysis-summary", pageConfig.viewMode === "analysis");
+      const feedCards = [
+        { value: data.count || 0, label: `${data.window_hours}h news` },
+        { value: counts[baseline] || 0, label: publisherLabel(baseline) },
+        { value: competitorTotal, label: "Competitors" },
+        { value: (data.command_metrics || {}).active_actions || 0, label: "Queue" },
+      ];
+      const analysisCards = [
         {
           value: data.count || 0,
           label: `Last ${data.window_hours}h total`,
@@ -2335,6 +2433,7 @@ PAGE = """
         })),
         { value: topCategory ? topCategory.count : 0, label: "Hot beat", note: topCategory ? topCategory.name : "No category yet" }
       ];
+      const cards = pageConfig.viewMode === "analysis" ? analysisCards : feedCards;
 
       summaryGrid.innerHTML = cards.map((card) => `
         <article class="summary-card">
@@ -2408,17 +2507,15 @@ PAGE = """
 
     function renderCompareView(data) {
       const beats = beatOptions(data.articles || []);
-      let selectedBeat = "";
-      let selectedPublisher = "";
-      let sortDirection = "desc";
+      const viewState = feedViewState.compare;
       const beatOptionsHtml = ["", ...beats].map((name) => `
-        <button type="button" class="filter-option ${name ? "" : "active"}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
+        <button type="button" class="filter-option ${name === viewState.selectedBeat || (!name && !viewState.selectedBeat) ? "active" : ""}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
       `).join("");
       const publisherChips = ["", ...pageConfig.publishers].map((name) => `
-        <button type="button" class="filter-chip ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name ? escapeHtml(publisherLabel(name)) : "All publishers"}</button>
+        <button type="button" class="filter-chip ${name === viewState.selectedPublisher || (!name && !viewState.selectedPublisher) ? "active" : ""}" data-publisher="${escapeHtml(name)}">${name ? escapeHtml(publisherLabel(name)) : "All publishers"}</button>
       `).join("");
       content.innerHTML = `
-        <section class="page-grid">
+        <section class="page-grid feed-only">
           <section class="panel">
             <div class="panel-header">
               <div>
@@ -2427,30 +2524,16 @@ PAGE = """
               </div>
             </div>
             <div class="toolbar">
-              <input id="search" type="search" placeholder="Search headline, category, publisher">
+              <input id="search" type="search" placeholder="Search headline, category, publisher" value="${escapeHtml(viewState.searchTerm)}">
               <div class="filter-dropdown" id="compareBeat">
                 <button type="button" class="filter-dropdown-button" aria-haspopup="listbox" aria-expanded="false">
-                  <span>All beats</span>
+                  <span>${escapeHtml(viewState.selectedBeat || "All beats")}</span>
                 </button>
                 <div class="filter-menu" role="listbox">${beatOptionsHtml}</div>
               </div>
               <div class="filter-segments" id="comparePublisher">${publisherChips}</div>
             </div>
             <div class="publisher-stack" id="compareResults"></div>
-          </section>
-          <section class="stack">
-            ${renderSignalCard(data.live_signal || [])}
-            <section class="panel">
-              <div class="panel-header">
-                <div>
-                  <h3>Beat performance</h3>
-                  <p>Same beats merged across Bangla and English labels.</p>
-                </div>
-              </div>
-              <div class="analysis-block">
-                ${renderBeatPerformance(data.shared_categories || [], 8)}
-              </div>
-            </section>
           </section>
         </section>
       `;
@@ -2463,15 +2546,16 @@ PAGE = """
       const compareResults = document.getElementById("compareResults");
 
       function paintCompare() {
-        const term = search.value.trim().toLowerCase();
+        viewState.searchTerm = search.value.trim();
+        const term = viewState.searchTerm.toLowerCase();
         const filtered = (data.articles || []).filter((article) => {
           const text = `${article.Headline} ${article.Category} ${article.CanonicalCategory} ${article.Publisher}`.toLowerCase();
           const beatName = article.CanonicalCategory || article.Category || "Uncategorized";
-          return (!selectedBeat || beatName === selectedBeat) &&
-            (!selectedPublisher || article.Publisher === selectedPublisher) &&
+          return (!viewState.selectedBeat || beatName === viewState.selectedBeat) &&
+            (!viewState.selectedPublisher || article.Publisher === viewState.selectedPublisher) &&
             (!term || text.includes(term));
         });
-        const sorted = sortByTime(filtered, sortDirection);
+        const sorted = sortByTime(filtered, viewState.sortDirection);
 
         if (!sorted.length) {
           compareResults.innerHTML = '<div class="empty">No matching articles in this view.</div>';
@@ -2482,14 +2566,14 @@ PAGE = """
           <section class="publisher-section">
             <div class="publisher-heading">
               <h3>All publications</h3>
-              <div class="meta">${sorted.length} articles, ${sortDirection === "desc" ? "newest first" : "oldest first"}</div>
+              <div class="meta">${sorted.length} articles, ${viewState.sortDirection === "desc" ? "newest first" : "oldest first"}</div>
             </div>
             <table>
               <thead>
                 <tr>
                   <th>Publisher</th>
                   <th>Published</th>
-                  <th><button type="button" class="sort-toggle" data-sort-age data-direction="${sortDirection}" aria-label="Sort age ${sortDirection === "desc" ? "oldest first" : "newest first"}">Age</button></th>
+                  <th><button type="button" class="sort-toggle" data-sort-age data-direction="${viewState.sortDirection}" aria-label="Sort age ${viewState.sortDirection === "desc" ? "oldest first" : "newest first"}">Age</button></th>
                   <th>Category</th>
                   <th>Headline</th>
                   <th>Action</th>
@@ -2500,7 +2584,7 @@ PAGE = """
           </section>
         `;
         compareResults.querySelector("[data-sort-age]")?.addEventListener("click", () => {
-          sortDirection = sortDirection === "desc" ? "asc" : "desc";
+          viewState.sortDirection = viewState.sortDirection === "desc" ? "asc" : "desc";
           paintCompare();
         });
         bindActionControls(compareResults);
@@ -2520,8 +2604,8 @@ PAGE = """
       beat.querySelectorAll(".filter-option").forEach((option) => {
         option.addEventListener("click", (event) => {
           event.stopPropagation();
-          selectedBeat = option.dataset.beat || "";
-          beatLabel.textContent = selectedBeat || "All beats";
+          viewState.selectedBeat = option.dataset.beat || "";
+          beatLabel.textContent = viewState.selectedBeat || "All beats";
           beat.querySelectorAll(".filter-option").forEach((item) => item.classList.toggle("active", item === option));
           beat.classList.remove("open");
           beatButton.setAttribute("aria-expanded", "false");
@@ -2530,7 +2614,7 @@ PAGE = """
       });
       publisher.querySelectorAll(".filter-chip").forEach((chip) => {
         chip.addEventListener("click", () => {
-          selectedPublisher = chip.dataset.publisher || "";
+          viewState.selectedPublisher = chip.dataset.publisher || "";
           if (beat.classList.contains("open")) {
             beat.classList.remove("open");
             beatButton.setAttribute("aria-expanded", "false");
@@ -2543,74 +2627,39 @@ PAGE = """
     }
 
     function renderLiveView(data) {
-      const metrics = data.command_metrics || {};
       const beats = beatOptions(data.articles || []);
-      let selectedBeat = "";
-      let selectedPublisher = "";
-      let sortDirection = "desc";
+      const viewState = feedViewState.live;
       const beatOptionsHtml = ["", ...beats].map((name) => `
-        <button type="button" class="filter-option ${name ? "" : "active"}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
+        <button type="button" class="filter-option ${name === viewState.selectedBeat || (!name && !viewState.selectedBeat) ? "active" : ""}" data-beat="${escapeHtml(name)}">${name || "All beats"}</button>
       `).join("");
       const publisherChips = ["", ...pageConfig.publishers].map((name) => `
-        <button type="button" class="filter-chip ${name ? "" : "active"}" data-publisher="${escapeHtml(name)}">${name ? escapeHtml(publisherLabel(name)) : "All publishers"}</button>
+        <button type="button" class="filter-chip ${name === viewState.selectedPublisher || (!name && !viewState.selectedPublisher) ? "active" : ""}" data-publisher="${escapeHtml(name)}">${name ? escapeHtml(publisherLabel(name)) : "All publishers"}</button>
       `).join("");
+      const focusEnabled = document.body.classList.contains("news-focus");
 
       content.innerHTML = `
-        <section class="command-grid">
-          <article class="command-card">
-            <strong>${metrics.new_15m || 0}</strong>
-            <span>New in 15m</span>
-            <em>Fresh movement</em>
-          </article>
-          <article class="command-card">
-            <strong>${metrics.competitor_only || 0}</strong>
-            <span>Competitor-only</span>
-            <em>No Daily Star beat match</em>
-          </article>
-          <article class="command-card">
-            <strong>${metrics.daily_star_last_hour || 0}</strong>
-            <span>Daily Star 1h</span>
-            <em>Baseline pace</em>
-          </article>
-          <article class="command-card">
-            <strong>${metrics.active_actions || 0}</strong>
-            <span>Watching/assigned</span>
-            <em>Desk action queue</em>
-          </article>
-        </section>
-        <section class="page-grid live-layout">
+        <section class="page-grid live-layout feed-only">
           <section class="panel">
             <div class="panel-header">
               <div>
                 <h2>Reporter command</h2>
                 <p>Newest-first factual live feed for deciding what to watch, assign, or report now.</p>
               </div>
+              <div class="panel-tools">
+                <button type="button" class="focus-toggle ${focusEnabled ? "active" : ""}" id="newsFocusToggle" aria-pressed="${focusEnabled ? "true" : "false"}">${focusEnabled ? "Exit focus" : "Focus view"}</button>
+              </div>
             </div>
             <div class="toolbar">
-              <input id="liveSearch" type="search" placeholder="Search live feed">
+              <input id="liveSearch" type="search" placeholder="Search live feed" value="${escapeHtml(viewState.searchTerm)}">
               <div class="filter-dropdown" id="liveBeat">
                 <button type="button" class="filter-dropdown-button" aria-haspopup="listbox" aria-expanded="false">
-                  <span>All beats</span>
+                  <span>${escapeHtml(viewState.selectedBeat || "All beats")}</span>
                 </button>
                 <div class="filter-menu" role="listbox">${beatOptionsHtml}</div>
               </div>
               <div class="filter-segments" id="livePublisher">${publisherChips}</div>
             </div>
             <div class="publisher-stack" id="liveResults"></div>
-          </section>
-          <section class="stack">
-            ${renderSignalCard(data.live_signal || [])}
-            <section class="panel">
-              <div class="panel-header">
-                <div>
-                  <h3>Beat performance</h3>
-                  <p>Same beats merged across Bangla and English labels.</p>
-                </div>
-              </div>
-              <div class="analysis-block">
-                ${renderBeatPerformance(data.shared_categories || [], 8)}
-              </div>
-            </section>
           </section>
         </section>
       `;
@@ -2621,6 +2670,15 @@ PAGE = """
       const beatLabel = beatButton.querySelector("span");
       const publisher = document.getElementById("livePublisher");
       const liveResults = document.getElementById("liveResults");
+      const focusToggle = document.getElementById("newsFocusToggle");
+
+      focusToggle.addEventListener("click", () => {
+        const enabled = !document.body.classList.contains("news-focus");
+        document.body.classList.toggle("news-focus", enabled);
+        focusToggle.classList.toggle("active", enabled);
+        focusToggle.setAttribute("aria-pressed", enabled ? "true" : "false");
+        focusToggle.textContent = enabled ? "Exit focus" : "Focus view";
+      });
 
       function liveRows(rows) {
         return rows.map((article) => `
@@ -2638,21 +2696,22 @@ PAGE = """
       }
 
       function paintLive() {
-        const term = search.value.trim().toLowerCase();
+        viewState.searchTerm = search.value.trim();
+        const term = viewState.searchTerm.toLowerCase();
         const rows = sortByTime((data.articles || []).filter((article) => {
           const text = `${article.Headline} ${article.Category} ${article.CanonicalCategory} ${article.Publisher}`.toLowerCase();
           const beatName = article.CanonicalCategory || article.Category || "Uncategorized";
-          return (!selectedBeat || beatName === selectedBeat) &&
-            (!selectedPublisher || article.Publisher === selectedPublisher) &&
+          return (!viewState.selectedBeat || beatName === viewState.selectedBeat) &&
+            (!viewState.selectedPublisher || article.Publisher === viewState.selectedPublisher) &&
             (!term || text.includes(term));
-        }), sortDirection);
+        }), viewState.sortDirection);
 
         liveResults.innerHTML = rows.length ? `
           <div class="live-feed">
             <div class="live-feed-head">
               <span>Publisher</span>
               <span>Published</span>
-              <button type="button" class="sort-toggle" data-sort-age data-direction="${sortDirection}" aria-label="Sort age ${sortDirection === "desc" ? "oldest first" : "newest first"}">Age</button>
+              <button type="button" class="sort-toggle" data-sort-age data-direction="${viewState.sortDirection}" aria-label="Sort age ${viewState.sortDirection === "desc" ? "oldest first" : "newest first"}">Age</button>
               <span>Beat</span>
               <span>Headline</span>
               <span>Action</span>
@@ -2661,7 +2720,7 @@ PAGE = """
           </div>
         ` : '<div class="empty">No live items match these filters.</div>';
         liveResults.querySelector("[data-sort-age]")?.addEventListener("click", () => {
-          sortDirection = sortDirection === "desc" ? "asc" : "desc";
+          viewState.sortDirection = viewState.sortDirection === "desc" ? "asc" : "desc";
           paintLive();
         });
         bindActionControls(liveResults);
@@ -2677,8 +2736,8 @@ PAGE = """
       beat.querySelectorAll(".filter-option").forEach((option) => {
         option.addEventListener("click", (event) => {
           event.stopPropagation();
-          selectedBeat = option.dataset.beat || "";
-          beatLabel.textContent = selectedBeat || "All beats";
+          viewState.selectedBeat = option.dataset.beat || "";
+          beatLabel.textContent = viewState.selectedBeat || "All beats";
           beat.querySelectorAll(".filter-option").forEach((item) => item.classList.toggle("active", item === option));
           beat.classList.remove("open");
           beatButton.setAttribute("aria-expanded", "false");
@@ -2687,7 +2746,7 @@ PAGE = """
       });
       publisher.querySelectorAll(".filter-chip").forEach((chip) => {
         chip.addEventListener("click", () => {
-          selectedPublisher = chip.dataset.publisher || "";
+          viewState.selectedPublisher = chip.dataset.publisher || "";
           publisher.querySelectorAll(".filter-chip").forEach((item) => item.classList.toggle("active", item === chip));
           paintLive();
         });
