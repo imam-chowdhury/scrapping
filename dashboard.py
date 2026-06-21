@@ -2407,13 +2407,14 @@ PAGE = """
         .reduce((sum, [, count]) => sum + count, 0);
       const topCategory = (data.top_categories || [])[0];
       const showHourlyNotes = pageConfig.viewMode === "analysis";
+      if (pageConfig.viewMode !== "analysis") {
+        summaryGrid.hidden = true;
+        summaryGrid.innerHTML = "";
+        return;
+      }
+
+      summaryGrid.hidden = false;
       summaryGrid.classList.toggle("analysis-summary", pageConfig.viewMode === "analysis");
-      const feedCards = [
-        { value: data.count || 0, label: `${data.window_hours}h news` },
-        { value: counts[baseline] || 0, label: publisherLabel(baseline) },
-        { value: competitorTotal, label: "Competitors" },
-        { value: (data.command_metrics || {}).active_actions || 0, label: "Queue" },
-      ];
       const analysisCards = [
         {
           value: data.count || 0,
@@ -2433,9 +2434,8 @@ PAGE = """
         })),
         { value: topCategory ? topCategory.count : 0, label: "Hot beat", note: topCategory ? topCategory.name : "No category yet" }
       ];
-      const cards = pageConfig.viewMode === "analysis" ? analysisCards : feedCards;
 
-      summaryGrid.innerHTML = cards.map((card) => `
+      summaryGrid.innerHTML = analysisCards.map((card) => `
         <article class="summary-card">
           <strong>${card.value}</strong>
           <span>${card.label}</span>
@@ -2460,6 +2460,7 @@ PAGE = """
       }
 
       const extra = comparisonBits.length ? ` Comparison: ${comparisonBits.join("; ")}.` : "";
+      statusBox.hidden = pageConfig.viewMode !== "analysis" && !feed.error;
       statusBox.className = feed.error ? "status error" : "status";
       statusBox.textContent = feed.error
         ? `Scrape error: ${feed.error}`
