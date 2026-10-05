@@ -149,15 +149,15 @@ def parse_relative_minutes(text: str) -> Optional[int]:
     normalized = " ".join(text.split()).lower()
     if not normalized:
         return None
-    match = re.search(r"\b(\d+)\s*(sec(?:\(s\))?|secs|second(?:s)?)\s*ago\b", normalized)
+    match = re.search(r"\b(\d+)\s*(sec(?:\(s\))?|secs|second(?:s)?)(?:\s*ago\b|(?=\s*[•|]|$))", normalized)
     if match:
         return 0
 
-    match = re.search(r"\b(\d+)\s*(m|min(?:\(s\))?|mins|minute(?:s)?)\s*ago\b", normalized)
+    match = re.search(r"\b(\d+)\s*(m|min(?:\(s\))?|mins|minute(?:s)?)(?:\s*ago\b|(?=\s*[•|]|$))", normalized)
     if match:
         return int(match.group(1))
 
-    match = re.search(r"\b(\d+)\s*(h|hr|hrs|hour(?:\(s\))?|hours)\s*ago\b", normalized)
+    match = re.search(r"\b(\d+)\s*(h|hr|hrs|hour(?:\(s\))?|hours)(?:\s*ago\b|(?=\s*[•|]|$))", normalized)
     if match:
         return int(match.group(1)) * 60
 
@@ -319,6 +319,10 @@ def daily_star_card_age(anchor) -> Optional[int]:
     for _ in range(8):
         if node is None:
             break
+        for time_node in node.select(".card-info > span, time"):
+            age_minutes = parse_relative_minutes(time_node.get_text(" ", strip=True))
+            if age_minutes is not None:
+                return age_minutes
         age_minutes = parse_relative_minutes(node.get_text(" ", strip=True))
         if age_minutes is not None:
             return age_minutes
@@ -330,7 +334,7 @@ def daily_star_listing_cards(soup: BeautifulSoup):
     cards = soup.select(".views-row")
     if cards:
         return cards
-    return soup.select("article, .card, .card-content, .story-card")
+    return soup.select(".card, .story-card") or soup.select("article, .card-content")
 
 
 def extract_daily_star_article(
@@ -341,7 +345,7 @@ def extract_daily_star_article(
 ) -> Optional[Dict[str, str]]:
     try:
         soup = BeautifulSoup(fetch_html(link), "html.parser")
-    except requests.RequestException:
+    except (requests.RequestException, ScrapeBlockedError):
         return None
 
     title = soup.select_one("h1")
@@ -380,9 +384,16 @@ def scrape_daily_star(cutoff: datetime, article_cache: Optional[Dict[str, Dict[s
     candidates: Dict[str, Tuple[str, datetime]] = {}
     seen = set()
     now = dhaka_now()
+    listing_errors = []
+    successful_listings = 0
 
     for listing_url in DAILY_STAR_LISTING_URLS:
-        soup = BeautifulSoup(fetch_html(listing_url), "html.parser")
+        try:
+            soup = BeautifulSoup(fetch_html(listing_url, timeout=15, max_retries=1), "html.parser")
+        except (requests.RequestException, ScrapeBlockedError) as exc:
+            listing_errors.append(exc)
+            continue
+        successful_listings += 1
         for card in daily_star_listing_cards(soup):
             anchors = card.select("h1 a[href], h2 a[href], h3 a[href], h4 a[href], h5 a[href], h6 a[href]")
             if not anchors:
@@ -408,6 +419,9 @@ def scrape_daily_star(cutoff: datetime, article_cache: Optional[Dict[str, Dict[s
 
                 seen.add(link)
                 candidates[link] = (headline, published)
+
+    if not successful_listings and listing_errors:
+        raise listing_errors[-1]
 
     articles: List[Dict[str, str]] = []
     uncached_candidates = {}
@@ -919,6 +933,26 @@ def dhaka_post_article_from_row(row: Dict, cutoff: datetime) -> Optional[Dict[st
 
 
 def dhaka_post_rows_from_embedded_html(html: str) -> List[Dict]:
+    decoder = json.JSONDecoder()
+    parsed_rows = []
+    for script in BeautifulSoup(html, "html.parser").find_all("script"):
+        text = script.string or script.get_text()
+        for match in re.finditer(r"self\.__next_f\.push\(", text):
+            try:
+                payload, _ = decoder.raw_decode(text[match.end():].lstrip())
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, list) or len(payload) < 2 or not isinstance(payload[1], str):
+                continue
+            for start in re.finditer(r'\{\s*"(?:Id|Heading)"\s*:', payload[1]):
+                try:
+                    row, _ = decoder.raw_decode(payload[1][start.start():])
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("Heading") and row.get("URL"):
+                    parsed_rows.append(row)
+    if parsed_rows:
+        return parsed_rows
     rows = []
     starts = [match.start() for match in re.finditer(r'\{\\"Heading\\":', html)]
     for index, start in enumerate(starts):
@@ -950,10 +984,15 @@ def dhaka_post_latest_action_id(html: str) -> Optional[str]:
             )
         )
     )
+    if not urls:
+        urls = [
+            tag["src"] for tag in BeautifulSoup(html, "html.parser").select("script[src]")
+            if tag["src"].startswith("https://cdn.dhakapost.com/_next/static/")
+        ][:24]
     for url in urls:
         try:
-            script = fetch_html(url)
-        except requests.RequestException:
+            script = fetch_html(url, timeout=10, max_retries=1)
+        except (requests.RequestException, ScrapeBlockedError):
             continue
         match = re.search(r'createServerReference\)\("([0-9a-f]+)".*?"getMoreLatest"', script)
         if match:
@@ -974,16 +1013,19 @@ def dhaka_post_more_latest(action_id: str, limit: int, offset: int) -> List[Dict
         data=json.dumps([limit, offset]),
     )
     text = response.content.decode("utf-8", "replace")
-    match = re.search(r'1:(\{.*\})', text, re.DOTALL)
-    if not match:
-        return []
-    try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return []
-    data = payload.get("data") if isinstance(payload, dict) else {}
-    contents = data.get("contents") if isinstance(data, dict) else []
-    return contents if isinstance(contents, list) else []
+    for line in text.splitlines():
+        _, separator, value = line.partition(":")
+        if not separator:
+            continue
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        data = payload.get("data") if isinstance(payload, dict) else None
+        contents = data.get("contents") if isinstance(data, dict) else None
+        if isinstance(contents, list):
+            return contents
+    return []
 
 
 def scrape_dhaka_post(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
@@ -991,18 +1033,25 @@ def scrape_dhaka_post(cutoff: datetime, article_cache: Optional[Dict[str, Dict[s
     articles: List[Dict[str, str]] = []
     seen = set()
     page_size = 12
-    action_id = dhaka_post_latest_action_id(html)
+    try:
+        action_id = dhaka_post_latest_action_id(html)
+    except (requests.RequestException, ScrapeBlockedError):
+        action_id = None
     offset = 0
 
     while True:
-        if action_id:
-            rows = dhaka_post_more_latest(action_id, page_size, offset)
-        else:
-            rows = dhaka_post_rows_from_embedded_html(html) if offset == 0 else []
+        rows = dhaka_post_rows_from_embedded_html(html) if offset == 0 else []
+        if action_id and (offset or not rows):
+            try:
+                rows = dhaka_post_more_latest(action_id, page_size, offset)
+            except (requests.RequestException, ScrapeBlockedError) as exc:
+                print(f"Scrape warning: Dhaka Post pagination: {exc}", file=sys.stderr)
+                break
         if not rows:
             break
 
         oldest_on_page: Optional[datetime] = None
+        previous_seen = len(seen)
         for row in rows:
             row_published = dhaka_post_row_published(row)
             if row_published:
@@ -1026,9 +1075,9 @@ def scrape_dhaka_post(cutoff: datetime, article_cache: Optional[Dict[str, Dict[s
                 article_cache[link] = article
             articles.append(article)
 
-        if len(rows) < page_size or (oldest_on_page is not None and oldest_on_page < cutoff):
+        if not action_id or len(rows) < page_size or len(seen) == previous_seen or offset >= 1200 or (oldest_on_page is not None and oldest_on_page < cutoff):
             break
-        offset += page_size
+        offset += len(rows)
 
     return articles
 
@@ -1050,175 +1099,15 @@ def json_ld_has_type(node: Dict, type_name: str) -> bool:
     return node_type == type_name
 
 
-BDNEWS_SKIP_SECTIONS = {"image", "media-en", "tube", "hello"}
-BDNEWS_SECTIONS = (
-    "",
-    "bangladesh",
-    "politics",
-    "economy",
-    "business",
-    "world",
-    "sport",
-    "cricket",
-    "health",
-    "campus",
-    "technology",
-    "environment",
-    "opinion",
-    "neighbours",
-)
-
-
-BDNEWS_WORKERS = int(os.getenv("BDNEWS_WORKERS", "8"))
-BDNEWS_TIMEOUT = int(os.getenv("BDNEWS_TIMEOUT", "8"))
-BDNEWS_MAX_SECTION_FAILURES = int(os.getenv("BDNEWS_MAX_SECTION_FAILURES", "3"))
-BDNEWS_MAX_LINKS = int(os.getenv("BDNEWS_MAX_LINKS", "30"))
-
-
-def bdnews_story_id(link: str) -> str:
-    segments = [segment for segment in urlparse(link).path.split("/") if segment]
-    if segments and re.fullmatch(r"[0-9a-f]{8,}", segments[-1]):
-        return segments[-1]
-    return link
-
-
-def bdnews_link_score(link: str) -> Tuple[int, int]:
-    segments = [segment for segment in urlparse(link).path.split("/") if segment]
-    first = segments[0].lower() if segments else ""
-    # Prefer canonical section URLs like /world/asia-pacific/id over alias URLs like /asia-pacific/id.
-    return (1 if first in BDNEWS_SECTIONS else 0, len(segments))
-
-
-def bdnews_article_links_from_html(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links_by_story: Dict[str, str] = {}
-    for anchor in soup.select("a[href]"):
-        link = urljoin("https://bdnews24.com/", anchor.get("href", ""))
-        parsed = urlparse(link)
-        if parsed.netloc != "bdnews24.com":
-            continue
-        segments = [segment for segment in parsed.path.split("/") if segment]
-        if len(segments) < 2 or segments[0].lower() in BDNEWS_SKIP_SECTIONS:
-            continue
-        if not re.fullmatch(r"[0-9a-f]{8,}", segments[-1]):
-            continue
-        normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        story_id = bdnews_story_id(normalized)
-        existing = links_by_story.get(story_id)
-        if not existing or bdnews_link_score(normalized) > bdnews_link_score(existing):
-            links_by_story[story_id] = normalized
-    return list(links_by_story.values())
-
-
-def bdnews_latest_candidates(max_links: int = 180) -> List[str]:
-    links: List[str] = []
-    seen = set()
-    failures = 0
-    for section in BDNEWS_SECTIONS:
-        url = "https://bdnews24.com/" if not section else f"https://bdnews24.com/{section}"
-        try:
-            page_links = bdnews_article_links_from_html(fetch_html(url, timeout=BDNEWS_TIMEOUT, max_retries=1))
-        except (requests.RequestException, ScrapeBlockedError):
-            failures += 1
-            if failures >= BDNEWS_MAX_SECTION_FAILURES and not links:
-                break
-            continue
-        failures = 0
-
-        for link in page_links:
-            story_id = bdnews_story_id(link)
-            if story_id in seen:
-                continue
-            seen.add(story_id)
-            links.append(link)
-            if len(links) >= max_links:
-                return links
-    return links
-
-
-def extract_bdnews24_article(link: str, cutoff: datetime) -> Optional[Dict[str, str]]:
-    try:
-        soup = BeautifulSoup(fetch_html(link, timeout=BDNEWS_TIMEOUT, max_retries=1), "html.parser")
-    except (requests.RequestException, ScrapeBlockedError):
-        return None
-
-    headline = ""
-    published = None
-    summary = meta_description(soup)
-    snippet = ""
-    category = path_category_from_link(link)
-
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.get_text(strip=True))
-        except json.JSONDecodeError:
-            continue
-
-        for node in json_ld_nodes(data):
-            if not json_ld_has_type(node, "NewsArticle"):
-                continue
-            headline = clean_text(node.get("headline") or headline, limit=300)
-            summary = clean_text(node.get("description") or summary)
-            snippet = clean_text(node.get("articleBody") or snippet)
-            published = parse_site_datetime(node.get("datePublished", ""))
-
-    if not headline:
-        title = soup.select_one("h1")
-        headline = clean_text(title.get_text(" ", strip=True) if title else "", limit=300)
-    if not snippet:
-        snippet = body_snippet(soup, "article p, main p, .story-element p, .article-body p, p")
-
-    if not headline or not published or published < cutoff:
-        return None
-
-    return {
-        "Headline": headline,
-        "Link": link,
-        "PublishedTime": published.isoformat(),
-        "Publisher": "bdnews24.com",
-        "Category": category,
-        "Summary": summary,
-        "BodySnippet": snippet or summary,
-    }
-
-
-def scrape_bdnews24(cutoff: datetime, article_cache: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, str]]:
-    articles: List[Dict[str, str]] = []
-    uncached_links: List[str] = []
-    for link in bdnews_latest_candidates(max_links=BDNEWS_MAX_LINKS):
-        cached = cached_article(link, article_cache)
-        if cached and cached.get("Publisher") == "bdnews24.com":
-            try:
-                cached_published = datetime.fromisoformat(cached["PublishedTime"]).astimezone(DHAKA)
-            except (KeyError, ValueError):
-                cached_published = None
-            if cached_published and cached_published >= cutoff and has_match_context(cached):
-                articles.append(cached)
-                continue
-
-        uncached_links.append(link)
-
-    with ThreadPoolExecutor(max_workers=max(1, BDNEWS_WORKERS)) as executor:
-        futures = {executor.submit(extract_bdnews24_article, link, cutoff): link for link in uncached_links}
-        for future in as_completed(futures):
-            article = future.result()
-            if not article:
-                continue
-            if article_cache is not None:
-                article_cache[futures[future]] = article
-            articles.append(article)
-
-    return articles
 
 
 SOURCE_REGISTRY: List[Dict[str, object]] = [
-    {"id": "daily_star", "publisher": "The Daily Star", "scraper": scrape_daily_star},
     {"id": "prothomalo", "publisher": "Prothom Alo", "scraper": scrape_prothomalo},
     {"id": "tbs", "publisher": "The Business Standard", "scraper": scrape_tbs},
+    {"id": "daily_star", "publisher": "The Daily Star", "scraper": scrape_daily_star},
     {"id": "samakal", "publisher": "Samakal", "scraper": scrape_samakal},
     {"id": "bonik_barta", "publisher": "Bonik Barta", "scraper": scrape_bonik_barta},
     {"id": "dhaka_post", "publisher": "Dhaka Post", "scraper": scrape_dhaka_post},
-    {"id": "bdnews24", "publisher": "bdnews24.com", "scraper": scrape_bdnews24},
 ]
 
 SOURCE_LOOKUP = {source["id"]: source for source in SOURCE_REGISTRY}
@@ -1232,6 +1121,7 @@ def scrape_sources(
     cutoff: datetime,
     source_ids: Optional[List[str]] = None,
     article_cache: Optional[Dict[str, Dict[str, str]]] = None,
+    source_status: Optional[Dict] = None,
 ) -> List[Dict[str, str]]:
     requested_ids = source_ids or list(SOURCE_LOOKUP.keys())
     articles: List[Dict[str, str]] = []
@@ -1249,8 +1139,13 @@ def scrape_sources(
             source_articles = scraper(cutoff, article_cache=article_cache)
         except Exception as exc:
             publisher = source.get("publisher", source_id)
+            if source_status is not None:
+                source_status[str(publisher)] = {"status": "error", "error": str(exc), "count": 0}
             print(f"Scrape warning: {publisher}: {exc}", file=sys.stderr)
             continue
+
+        if source_status is not None:
+            source_status[str(source["publisher"])] = {"status": "ready" if source_articles else "empty", "count": len(source_articles)}
 
         for article in source_articles:
             link = article.get("Link")

@@ -51,7 +51,7 @@ MATCH_BATCH_SIZE = int(os.getenv("MATCH_BATCH_SIZE", "5"))
 OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "120"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 SOURCE_PUBLISHERS = publisher_order()
-PUBLISHER_ORDER = [BASELINE_PUBLISHER] + [name for name in SOURCE_PUBLISHERS if name != BASELINE_PUBLISHER]
+PUBLISHER_ORDER = list(SOURCE_PUBLISHERS)
 COMPETITOR_PUBLISHERS = [name for name in PUBLISHER_ORDER if name != BASELINE_PUBLISHER]
 ACTION_STATUSES = ("New", "Watching", "Assigned", "Reported", "Ignored")
 PUBLISHER_LOGO_URLS = {
@@ -61,7 +61,6 @@ PUBLISHER_LOGO_URLS = {
     "samakal": "https://samakal.com/frontend/media/common/favicon/favicon-32x32.png",
     "bonik-barta": "https://www.bonikbarta.com/favicon.webp",
     "dhaka-post": "https://cdn.dhakapost.com/config/favicon/favicon-32x32.png",
-    "bdnews24": "https://bdnews24.com/frontend/assets/images/common/favicon.png",
 }
 LOGO_HEADERS = {
     "User-Agent": (
@@ -197,6 +196,7 @@ state: Dict = {
     "match_cache": {},
     "comparison": {},
     "actions": {},
+    "source_status": {},
 }
 
 
@@ -212,7 +212,7 @@ def hours_limit(value: float) -> float:
 
 def filter_recent_articles(articles: List[Dict], hours: float) -> List[Dict]:
     cutoff = dhaka_now() - timedelta(hours=hours_limit(hours))
-    filtered = [article for article in articles if parse_time(article["PublishedTime"]) >= cutoff]
+    filtered = [article for article in articles if article.get("Publisher") in PUBLISHER_ORDER and parse_time(article["PublishedTime"]) >= cutoff]
     filtered.sort(key=lambda item: item["PublishedTime"], reverse=True)
     return filtered
 
@@ -836,6 +836,7 @@ def feed_snapshot(hours: float) -> Dict:
         next_run = state["next_run"]
         refreshing = state["refreshing"]
         error = state["error"]
+        source_status = dict(state.get("source_status", {}))
 
     articles = enrich_articles(filter_recent_articles(base_articles, hours), actions, comparison)
     live_articles = enrich_articles(filter_recent_articles(base_articles, LIVE_HOURS), actions, comparison)
@@ -850,6 +851,7 @@ def feed_snapshot(hours: float) -> Dict:
         "next_run": next_run,
         "refreshing": refreshing,
         "error": error,
+        "source_status": source_status,
         "window_hours": hours_limit(hours),
         "publisher_counts": sorted_publisher_counts(articles),
         "last_hour_counts": sorted_publisher_counts(live_articles),
@@ -919,7 +921,8 @@ def analysis_snapshot(hours: float) -> Dict:
 
 def save_state() -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    with DATA_FILE.open("w", encoding="utf-8") as file:
+    temporary_file = DATA_FILE.with_suffix(".json.tmp")
+    with temporary_file.open("w", encoding="utf-8") as file:
         json.dump(
             {
                 "articles": state["articles"],
@@ -931,11 +934,13 @@ def save_state() -> None:
                 "match_cache": state.get("match_cache", {}),
                 "comparison": state.get("comparison", {}),
                 "actions": state.get("actions", {}),
+                "source_status": state.get("source_status", {}),
             },
             file,
             ensure_ascii=False,
             indent=2,
         )
+    temporary_file.replace(DATA_FILE)
 
 
 def load_state() -> None:
@@ -952,6 +957,10 @@ def load_state() -> None:
         state["last_updated"] = payload.get("last_updated")
         state["next_run"] = payload.get("next_run")
         state["error"] = payload.get("error")
+        state["source_status"] = {
+            publisher: info for publisher, info in payload.get("source_status", {}).items()
+            if publisher in PUBLISHER_ORDER
+        }
         state["article_cache"] = prune_article_cache(payload.get("article_cache") or {article["Link"]: article for article in articles if article.get("Link")}, articles)
         state["embedding_cache"] = prune_embedding_cache(payload.get("embedding_cache", {}), articles)
         state["match_cache"] = prune_match_cache(payload.get("match_cache", {}))
@@ -973,10 +982,15 @@ def refresh_news() -> None:
         current_cache = dict(state.get("embedding_cache", {}))
         current_match_cache = dict(state.get("match_cache", {}))
         current_comparison = dict(state.get("comparison") or empty_comparison(status="disabled"))
+        previous_articles = list(state["articles"])
 
     try:
         cutoff = dhaka_now() - timedelta(hours=WINDOW_HOURS)
-        articles = dedupe_articles(scrape_sources(cutoff, article_cache=current_article_cache))
+        source_status = {}
+        fetched_articles = scrape_sources(cutoff, article_cache=current_article_cache, source_status=source_status)
+        articles = dedupe_articles([
+            *current_article_cache.values(), *previous_articles, *fetched_articles
+        ])
         fresh_articles = prune_articles(articles)
         article_cache = update_article_cache(current_article_cache, fresh_articles)
 
@@ -993,6 +1007,7 @@ def refresh_news() -> None:
         now = dhaka_now()
         with state_lock:
             state["articles"] = fresh_articles
+            state["source_status"] = source_status
             state["article_cache"] = article_cache
             state["embedding_cache"] = embedding_cache
             state["match_cache"] = match_cache
@@ -1479,10 +1494,6 @@ PAGE = """
       background: #e9f6fd;
       border-color: #b6ddf3;
     }
-    .publisher-count-chip.publisher-bdnews24 {
-      background: #fff0f1;
-      border-color: #efc2c7;
-    }
     .publisher-count-chip.publisher-unknown {
       background: #f8f7f3;
     }
@@ -1567,11 +1578,6 @@ PAGE = """
       background: #e9f6fd;
       border-color: #b6ddf3;
       color: #0b5f89;
-    }
-    .publisher-bdnews24 {
-      background: #fff0f1;
-      border-color: #efc2c7;
-      color: #a01622;
     }
     .publisher-unknown {
       background: #f8f7f3;
@@ -1877,7 +1883,6 @@ PAGE = """
     .headline-link-samakal { color: #64328f; }
     .headline-link-bonik-barta { color: #8a4a10; }
     .headline-link-dhaka-post { color: #0b5f89; }
-    .headline-link-bdnews24 { color: #a01622; }
     .headline-link-unknown { color: var(--accent-dark); }
     .headline-cell a:hover { text-decoration-thickness: 2px; }
     .analysis-grid {
@@ -2163,7 +2168,6 @@ PAGE = """
       if (value === "Samakal") return "publisher-samakal";
       if (value === "Bonik Barta") return "publisher-bonik-barta";
       if (value === "Dhaka Post") return "publisher-dhaka-post";
-      if (value === "bdnews24.com" || value === "bdnews24") return "publisher-bdnews24";
       return "publisher-unknown";
     }
 
@@ -2174,7 +2178,6 @@ PAGE = """
       if (value === "Samakal") return "headline-link-samakal";
       if (value === "Bonik Barta") return "headline-link-bonik-barta";
       if (value === "Dhaka Post") return "headline-link-dhaka-post";
-      if (value === "bdnews24.com" || value === "bdnews24") return "headline-link-bdnews24";
       return "headline-link-unknown";
     }
 
@@ -2185,7 +2188,6 @@ PAGE = """
       if (value === "Samakal") return "/api/publisher-logo/samakal";
       if (value === "Bonik Barta") return "/api/publisher-logo/bonik-barta";
       if (value === "Dhaka Post") return "/api/publisher-logo/dhaka-post";
-      if (value === "bdnews24.com" || value === "bdnews24") return "/api/publisher-logo/bdnews24";
       return "";
     }
 
@@ -2249,8 +2251,7 @@ PAGE = """
     function publisherLabel(name) {
       const labels = {
         "The Daily Star": "TDS",
-        "The Business Standard": "TBS",
-        "bdnews24.com": "bdnews24"
+        "The Business Standard": "TBS"
       };
       return labels[name] || name;
     }
@@ -2460,11 +2461,16 @@ PAGE = """
       }
 
       const extra = comparisonBits.length ? ` Comparison: ${comparisonBits.join("; ")}.` : "";
-      statusBox.hidden = pageConfig.viewMode !== "analysis" && !feed.error;
+      const unavailable = Object.entries(feed.source_status || {})
+        .filter(([, info]) => info.status === "error" || info.status === "empty")
+        .map(([publisher]) => publisherLabel(publisher));
+      statusBox.hidden = pageConfig.viewMode !== "analysis" && !feed.error && !unavailable.length;
       statusBox.className = feed.error ? "status error" : "status";
       statusBox.textContent = feed.error
         ? `Scrape error: ${feed.error}`
-        : `Last updated: ${lastUpdated}. Next scheduled scrape: ${nextRun}.${extra}`;
+        : unavailable.length
+          ? `No new items fetched from ${unavailable.join(", ")}. Previously fetched items remain within their original time window.`
+          : `Last updated: ${lastUpdated}. Next scheduled scrape: ${nextRun}.${extra}`;
       refreshBtn.disabled = Boolean(feed.refreshing);
     }
 
